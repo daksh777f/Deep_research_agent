@@ -129,3 +129,135 @@ const replaceCitations = (children: React.ReactNode, sources: Source[] = []) => 
                 const isCitation = part.match(/^[(\[](?:Source\s+)?(\d[\d,\s]*)[)\]]$/i);
                 if (isCitation) {
                     // Extract all numbers
+                    const indices = [...part.matchAll(/(\d+)/g)]
+                        .map(m => parseInt(m[1]) - 1);
+
+                    if (indices.length > 0) {
+                        return <CitationGroup key={i} indices={indices} sources={sources} />;
+                    }
+                }
+                return part;
+            });
+        }
+        return child;
+    });
+};
+
+export function Markdown({ content, className, sources }: MarkdownProps) {
+    // Strip markdown code blocks if present (LLM often wraps output in ```markdown ... ```)
+    const cleanedContent = content.replace(/^```markdown\n?/, '').replace(/^```\n?/, '').replace(/\n?```$/, '');
+
+    return (
+        <div className={cn("prose prose-invert max-w-none break-words", className)}>
+            <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                components={{
+                    h1: ({ className, ...props }) => (
+                        <h1 className={cn("mt-2 scroll-m-20 text-3xl font-bold tracking-tight text-white/90", className)} {...props} />
+                    ),
+                    h2: ({ className, ...props }) => (
+                        <h2 className={cn("mt-10 scroll-m-20 border-b border-zinc-800 pb-2 text-2xl font-semibold tracking-tight first:mt-0 text-zinc-100", className)} {...props} />
+                    ),
+                    h3: ({ className, ...props }) => (
+                        <h3 className={cn("mt-8 scroll-m-20 text-xl font-semibold tracking-tight text-zinc-200", className)} {...props} />
+                    ),
+                    h4: ({ className, ...props }) => (
+                        <h4 className={cn("mt-8 scroll-m-20 text-lg font-semibold tracking-tight text-zinc-300", className)} {...props} />
+                    ),
+                    h5: ({ className, ...props }) => (
+                        <h5 className={cn("mt-8 scroll-m-20 text-base font-semibold tracking-tight text-zinc-300", className)} {...props} />
+                    ),
+                    h6: ({ className, ...props }) => (
+                        <h6 className={cn("mt-8 scroll-m-20 text-base font-semibold tracking-tight text-zinc-400", className)} {...props} />
+                    ),
+                    a: ({ className, href, children, ...props }) => {
+                        // Check anchor links that might be citations
+                        const sourceIndex = sources?.findIndex(s => s.url === href);
+                        if (sourceIndex !== undefined && sourceIndex !== -1 && sources) {
+                            return (
+                                <a
+                                    href={href}
+                                    className={cn("font-medium underline underline-offset-4 text-blue-400 hover:text-blue-300 transition-colors", className)}
+                                    {...props}
+                                >
+                                    {children}
+                                </a>
+                            );
+                        }
+                        return (
+                            <a className={cn("font-medium underline underline-offset-4 text-blue-400 hover:text-blue-300 transition-colors", className)} {...props}>
+                                {children}
+                            </a>
+                        )
+                    },
+                    // Render paragraphs as divs to avoid invalid nesting when
+                    // citation components inject block-level elements (HoverCardContent)
+                    p: ({ className, children, ...props }) => (
+                        <div role="group" className={cn("leading-7 [&:not(:first-child)]:mt-6 text-zinc-300", className)} {...props}>
+                            {replaceCitations(children, sources)}
+                        </div>
+                    ),
+                    li: ({ className, children, ...props }) => (
+                        <li className={cn("mt-2", className)} {...props}>
+                            {replaceCitations(children, sources)}
+                        </li>
+                    ),
+                    blockquote: ({ className, ...props }) => (
+                        <blockquote className={cn("mt-6 border-l-2 border-zinc-700 pl-6 italic text-zinc-400", className)} {...props} />
+                    ),
+                    img: ({ className, alt, ...props }) => (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img className={cn("rounded-md border border-zinc-800 bg-zinc-900 my-4", className)} alt={alt} {...props} />
+                    ),
+                    hr: ({ ...props }) => <hr className="my-8 border-zinc-800" {...props} />,
+                    table: ({ className, ...props }) => (
+                        <div className="my-6 w-full overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-900/30">
+                            <table className={cn("w-full caption-bottom text-sm", className)} {...props} />
+                        </div>
+                    ),
+                    tr: ({ className, ...props }) => (
+                        <tr className={cn("m-0 border-b border-zinc-800 p-0 even:bg-zinc-900/50 hover:bg-zinc-800/50 transition-colors", className)} {...props} />
+                    ),
+                    th: ({ className, ...props }) => (
+                        <th
+                            className={cn(
+                                "border-zinc-800 px-4 py-3 text-left font-bold text-zinc-100 [&[align=center]]:text-center [&[align=right]]:text-right bg-zinc-900/80",
+                                className
+                            )}
+                            {...props}
+                        />
+                    ),
+                    td: ({ className, ...props }) => (
+                        <td
+                            className={cn(
+                                "border-zinc-800 px-4 py-3 text-left [&[align=center]]:text-center [&[align=right]]:text-right text-zinc-300",
+                                className
+                            )}
+                            {...props}
+                        />
+                    ),
+                    pre: ({ className, ...props }) => (
+                        <pre
+                            className={cn(
+                                "mb-4 mt-6 overflow-x-auto rounded-lg border border-zinc-800 bg-zinc-950 py-4 px-4 dark:bg-zinc-950 text-zinc-200",
+                                className
+                            )}
+                            {...props}
+                        />
+                    ),
+                    code: ({ className, ...props }) => (
+                        <code
+                            className={cn(
+                                "relative rounded bg-zinc-900 px-[0.3rem] py-[0.2rem] font-mono text-sm font-semibold text-zinc-200 border border-zinc-800",
+                                className
+                            )}
+                            {...props}
+                        />
+                    ),
+                }}
+            >
+                {cleanedContent}
+            </ReactMarkdown>
+        </div>
+    );
+}
