@@ -239,3 +239,244 @@ After evaluating all claims in the source:
 
 ## 6. Engineering Impact Assessment
 
+### Impact Classification
+
+Classify how the validated claims affect downstream engineering decisions:
+
+| Impact Level | Criteria | Corroboration Threshold |
+|-------------|----------|------------------------|
+| `"high"` | Claim affects architectural decisions, compliance/security posture, cost/budget, or scalability design | ≥ 3 independent sources; ≥ 1 primary source required |
+| `"medium"` | Claim affects implementation approach, tool selection, or optimization strategy | ≥ 2 independent sources (standard threshold) |
+| `"low"` | Informational claim, background context, or non-critical detail | ≥ 1 source sufficient |
+
+**Automatic escalation**: If `engineering_impact == "high"`:
+- Corroboration threshold increases to ≥ 3 independent sources
+- At least 1 source must be primary (peer-reviewed, official documentation, or government)
+- Missing corroboration at this level → automatic recommendation: `"verify"`
+
+#### High-Impact Practicality Clause
+
+However, for emerging technology or novel domains where ≥3 sources may be impossible, **allow recommendation upgrade** from `"reject"` to `"verify"` if:
+- ≥ 2 independent sources exist
+- At least 1 source has reliability_score ≥ 0.8
+- No critical contradictions exist between sources
+- Document the escala override in `validation_notes`
+
+This prevents paralysis on genuinely novel topics while maintaining rigor.
+
+---
+
+## 7. Hard Rejection Rules
+
+Immediately set `recommendation: "reject"` if ANY of the following conditions are met:
+
+1. **Low reliability**: `reliability_score < 0.40` after all adjustments
+2. **Contradicted claim**: Claim contradicts ≥ 2 higher-reliability sources
+3. **Known misinformation**: Source identified as a known misinformation domain
+4. **Unsupported quantitative claim**: Quantitative claim with zero supporting evidence
+5. **Total performance gate failure**: All 4 performance dimensions missing for a benchmark claim
+
+Hard rejections override any other recommendation logic. Document the specific trigger in `validation_notes`.
+
+---
+
+## 8. Reliability Score Rubric (Reference)
+
+| Score Range | Description | Examples |
+|-------------|-------------|----------|
+| 0.90–1.00 | Primary sources, peer-reviewed, highly authoritative | Nature, Science, IEEE, official .gov/.edu docs |
+| 0.70–0.89 | Reputable news, established organizations, documented methodology | Reuters, BBC, official vendor docs with transparency |
+| 0.50–0.69 | Secondary sources, expert blogs, partial documentation | Expert Medium posts, Stack Overflow verified answers |
+| 0.30–0.49 | Unverified sources, potential bias, weak methodology | Opinion pieces, forums, vendor blogs without corroboration |
+| 0.00–0.29 | Known unreliable, contradicts established facts, or fails hard rejection | Misinformation sites, unsupported vendor claims |
+
+---
+
+## 9. Validation Output Format
+
+```json
+{
+    "reliability_score": 0.0-1.0,
+    "score_breakdown": {
+        "domain_trust": 0.0-1.0,
+        "evidence_transparency": 0.0-1.0,
+        "methodology_clarity": 0.0-1.0,
+        "source_independence": 0.0-1.0,
+        "recency": 0.0-1.0
+    },
+    "penalty_adjustments": [
+        {"reason": "description", "penalty": -0.XX}
+    ],
+    "source_credibility": "high|medium|low",
+    "content_veracity": "verified|likely|uncertain|questionable",
+    "engineering_impact": "low|medium|high",
+    "incentive_bias": "none|possible|probable",
+    "corroboration_analysis": {
+        "independent_sources": <count>,
+        "vendor_sources": <count>,
+        "concentration_risk": true|false,
+        "cross_source_consistency": "consistent|partially_consistent|contradictory"
+    },
+    "key_claims": ["claim 1", "claim 2"],
+    "supported_claims": ["claims with evidence"],
+    "unsupported_claims": ["claims without evidence"],
+    "quantitative_claims": [
+        {
+            "claim": "specific metric",
+            "corroboration_count": <number>,
+            "is_vendor_sourced": true|false,
+            "verification_status": "verified|unverified|vendor-reported|flagged"
+        }
+    ],
+    "performance_claims": [
+        {
+            "claim": "benchmark claim",
+            "has_dataset_size": true|false,
+            "has_hardware_environment": true|false,
+            "has_test_conditions": true|false,
+            "has_workload_context": true|false,
+            "has_reproducibility": true|false,
+            "completeness_score": 0.0-1.0
+        }
+    ],
+    "bias_flags": {
+        "vendor_authored": true|false,
+        "conflict_of_interest": "none|minor|significant",
+        "marketing_language_detected": true|false,
+        "independent_verification": <count>
+    },
+    "potential_issues": ["issue 1", "issue 2"],
+    "validation_notes": "Detailed justification for the score including factor-by-factor reasoning",
+    "recommendation": "accept|verify|reject"
+}
+```
+
+---
+
+## 10. Validation Workflow
+
+Execute the following steps in order for every source evaluation:
+
+1. **Classify claim types**: Categorize each claim as factual, quantitative, performance-related, or opinion
+2. **Assess engineering impact**: Determine if claims affect architecture, security, cost, or scalability → set corroboration thresholds
+3. **Compute weighted factors**: Score each of the 5 reliability factors independently (domain_trust, evidence_transparency, methodology_clarity, source_independence, recency)
+4. **Cross-verify quantitative claims**: For quantitative/performance claims, count independent sources and check corroboration
+5. **Gate performance claims**: If performance-related, verify dataset size, hardware environment, workload context, reproducibility
+6. **Detect bias & incentives**: Flag vendor authorship, financial incentives, marketing language
+7. **Check source concentration**: If > 50% of critical claims from single source → flag
+8. **Apply penalty adjustments**: Subtract all applicable penalties from the weighted sum
+9. **Check hard rejection rules**: If any trigger met → immediately set `"reject"`
+10. **Compute final score**: Produce `reliability_score` with full `score_breakdown` and `penalty_adjustments`
+11. **Set recommendation**: Use impact-aware logic:
+    - If **engineering_impact == "low"**: `"accept"` (≥ 0.65), `"verify"` (0.40–0.64), `"reject"` (< 0.40)
+    - If **engineering_impact == "medium"**: `"accept"` (≥ 0.70), `"verify"` (0.40–0.69), `"reject"` (< 0.40)
+    - If **engineering_impact == "high"**: `"accept"` (≥ 0.80), `"verify"` (0.50–0.79), `"reject"` (< 0.50 or hard rejection)
+    - **Exception**: High-impact practicality clause (section 6) allows `"verify"` if conditions met even below thresholds
+
+---
+
+## 11. Scoring Application Examples
+
+### Example 1: Vendor Performance Claim (High Engineering Impact)
+
+- **Source**: Company X's blog about its own product
+- **Claim**: "System Y is 50% faster than competitors"
+- **Engineering impact**: `"high"` (affects architectural decisions)
+
+**Factor Scores**:
+| Factor | Raw Score | Reasoning |
+|--------|-----------|-----------|
+| Domain Trust (×0.40) | 0.55 | Company blog |
+| Evidence Transparency (×0.20) | 0.30 | No citations or data references |
+| Methodology Clarity (×0.15) | 0.10 | No dataset, conditions, or workload |
+| Source Independence (×0.15) | 0.20 | Vendor self-report, no third-party |
+| Recency (×0.10) | 0.90 | Published this year |
+
+**Weighted sum**: (0.55×0.40) + (0.30×0.20) + (0.10×0.15) + (0.20×0.15) + (0.90×0.10) = 0.220 + 0.060 + 0.015 + 0.030 + 0.090 = **0.415**
+
+**Penalties**: Vendor self-report (−0.20) + Missing dataset (−0.10) + Missing conditions (−0.10) + Missing workload (−0.10) + Marketing language (−0.10) = **−0.60**
+
+**Final score**: max(0.415 − 0.60, 0.00) = **0.00** → Hard rejection (< 0.40)
+**Recommendation**: **reject**
+
+### Example 2: Third-Party Benchmark with Full Documentation
+
+- **Source**: Independent tech reviewer blog (established expert)
+- **Claim**: "GPT-4 scores 86.4% on MMLU (13,000 questions, zero-shot, 8×A100)"
+- **Engineering impact**: `"medium"`
+
+**Factor Scores**:
+| Factor | Raw Score | Reasoning |
+|--------|-----------|-----------|
+| Domain Trust (×0.40) | 0.65 | Expert blog with track record |
+| Evidence Transparency (×0.20) | 0.90 | Cites original paper and methodology |
+| Methodology Clarity (×0.15) | 0.95 | Full dataset, conditions, hardware specified |
+| Source Independence (×0.15) | 0.85 | Independent reviewer, corroborated by OpenAI docs |
+| Recency (×0.10) | 1.00 | Recent publication |
+
+**Weighted sum**: (0.65×0.40) + (0.90×0.20) + (0.95×0.15) + (0.85×0.15) + (1.00×0.10) = 0.260 + 0.180 + 0.1425 + 0.1275 + 0.100 = **0.810**
+
+**Penalties**: None applicable
+**Final score**: **0.81** → Recommendation: **accept**
+
+### Example 3: Academic Paper by Vendor Researcher
+
+- **Source**: Peer-reviewed conference paper (NeurIPS) by company researcher
+- **Claim**: "15% performance improvement on standard benchmark"
+- **Engineering impact**: `"medium"`
+
+**Factor Scores**:
+| Factor | Raw Score | Reasoning |
+|--------|-----------|-----------|
+| Domain Trust (×0.40) | 0.95 | Peer-reviewed venue |
+| Evidence Transparency (×0.20) | 0.90 | Full citations and methodology |
+| Methodology Clarity (×0.15) | 0.90 | Complete experimental setup |
+| Source Independence (×0.15) | 0.70 | Company author, but peer-reviewed (mitigated) |
+| Recency (×0.10) | 1.00 | Published this year |
+
+**Weighted sum**: (0.95×0.40) + (0.90×0.20) + (0.90×0.15) + (0.70×0.15) + (1.00×0.10) = 0.380 + 0.180 + 0.135 + 0.105 + 0.100 = **0.900**
+
+**Penalties**: None (peer review mitigates vendor bias)
+**Final score**: **0.90** → Recommendation: **accept**
+
+### Example 4: Forum Post with Quantitative Claim (High Impact)
+
+- **Source**: Anonymous Reddit post
+- **Claim**: "Switching to Kubernetes reduced our costs by 40%"
+- **Engineering impact**: `"high"` (cost and scalability)
+
+**Factor Scores**:
+| Factor | Raw Score | Reasoning |
+|--------|-----------|-----------|
+| Domain Trust (×0.40) | 0.25 | Anonymous forum |
+| Evidence Transparency (×0.20) | 0.15 | No citations, no data |
+| Methodology Clarity (×0.15) | 0.10 | No method, conditions, or context |
+| Source Independence (×0.15) | 0.40 | Not vendor, but unverifiable |
+| Recency (×0.10) | 0.90 | Recent post |
+
+**Weighted sum**: (0.25×0.40) + (0.15×0.20) + (0.10×0.15) + (0.40×0.15) + (0.90×0.10) = 0.100 + 0.030 + 0.015 + 0.060 + 0.090 = **0.295**
+
+**Penalties**: Quantitative with < 2 sources (−0.20)
+**Final score**: max(0.295 − 0.20, 0.00) = **0.095** → Hard rejection (< 0.40)
+**Recommendation**: **reject**
+
+---
+
+## 12. Evaluation Checklist
+
+Before assigning the final score, confirm every item:
+
+- [ ] Each of the 5 weighted factors has an explicit score with justification
+- [ ] `reliability_score` was computed from the formula, not estimated
+- [ ] All penalty adjustments are listed with reasons
+- [ ] Quantitative claims checked for ≥ 2 independent sources
+- [ ] Performance claims checked for dataset size, hardware, workload, reproducibility
+- [ ] Vendor/marketing authorship identified and flagged
+- [ ] Incentive bias classified (none/possible/probable)
+- [ ] Source concentration checked (> 50% from single origin?)
+- [ ] Engineering impact classified and corroboration threshold set accordingly
+- [ ] Hard rejection rules evaluated
+- [ ] `recommendation` is consistent with final `reliability_score`
+- [ ] `validation_notes` provides factor-by-factor justification
+
+Be rigorous and precise. Every score must be computed, not estimated. Every penalty must be justified. Every recommendation must follow from the evidence.
