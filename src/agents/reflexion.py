@@ -196,3 +196,202 @@ Be practical: if we're at iteration {current_iteration}, consider whether additi
         # Don't replan on first iteration to avoid cascading cycles
         if current_iteration == 0:
             return False
+        
+        knowledge_gaps = critique.get("knowledge_gaps", [])
+        quality_issues = critique.get("quality_issues", [])
+        overall_quality = critique.get("overall_quality", 0.5)
+        query_coverage = critique.get("query_coverage", "partial")
+        
+        # Significant gaps present
+        has_significant_gaps = len(knowledge_gaps) >= self.REPLAN_GAP_THRESHOLD
+        
+        # Quality is below threshold
+        low_quality = overall_quality < self.REPLAN_QUALITY_THRESHOLD
+        
+        # Coverage is minimal or none
+        poor_coverage = query_coverage in ["minimal", "none"]
+        
+        # Only replan on severe quality issues — removed "has_multiple_issues"
+        # which triggered on nearly every query
+        return has_significant_gaps or low_quality or poor_coverage
+    
+    def generate_refined_queries(
+        self,
+        original_query: str,
+        knowledge_gaps: List[str],
+        previous_queries: List[str],
+    ) -> List[str]:
+        """
+        Generate refined queries to fill knowledge gaps.
+        
+        Args:
+            original_query: The original research query
+            knowledge_gaps: Identified gaps from critique
+            previous_queries: Queries already executed
+            
+        Returns:
+            List of new queries to execute
+        """
+        if not knowledge_gaps:
+            return []
+        
+        refine_prompt = f"""Generate specific search queries to fill the following knowledge gaps.
+
+ORIGINAL QUERY: {original_query}
+
+KNOWLEDGE GAPS:
+{json.dumps(knowledge_gaps, indent=2)}
+
+PREVIOUS QUERIES (avoid duplicates):
+{json.dumps(previous_queries, indent=2)}
+
+Generate 2-3 NEW, SPECIFIC queries that would fill the gaps.
+Respond with JSON array: ["query 1", "query 2", ...]
+"""
+        
+        response = self.llm.chat(
+            messages=[{"role": "user", "content": refine_prompt}],
+            model="fast",
+            system_prompt=self.SYSTEM_PROMPT,
+            temperature=0.5,
+        )
+        
+        try:
+            content = response.content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+            
+            return json.loads(content.strip())
+        except:
+            # Fallback: turn gaps into queries
+            return [f"Research: {gap}" for gap in knowledge_gaps[:2]]
+    
+    def should_continue(
+        self,
+        critique: Dict[str, Any],
+        current_iteration: int,
+    ) -> bool:
+        """
+        Determine if research should continue.
+        
+        Args:
+            critique: Critique result
+            current_iteration: Current iteration number
+            
+        Returns:
+            True if should continue, False if complete
+        """
+        if current_iteration >= self.MAX_ITERATIONS:
+            return False
+        
+        # Check explicit continue flag
+        if not critique.get("continue_research", True):
+            return False
+        
+        # Check quality thresholds
+        quality = critique.get("overall_quality", 0)
+        confidence = critique.get("confidence_in_answer", 0)
+        
+        if quality >= 0.8 and confidence >= 0.8:
+            return False  # High quality, can stop
+        
+        # Check if there are actionable gaps
+        gaps = critique.get("knowledge_gaps", [])
+        if not gaps:
+            return False  # No gaps to fill
+        
+        return True
+    
+    def execute(self, input_data: Dict[str, Any]) -> AgentResult:
+        """
+        Execute the reflexion agent.
+        
+        Args:
+            input_data: Must contain 'query', 'findings', 'iteration'
+            
+        Returns:
+            AgentResult with critique and recommendations
+        """
+        query = input_data.get("query")
+        findings = input_data.get("findings", [])
+        iteration = input_data.get("iteration", 0)
+        previous_queries = input_data.get("previous_queries", [])
+        mode = input_data.get("mode", "deep")
+        
+        if not query:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name=self.name,
+                error="No query provided",
+            )
+        
+        try:
+            if mode == "quick":
+                self.log("Quick mode enabled; skipping reflexion")
+                return AgentResult(
+                    success=True,
+                    content={
+                        "overall_quality": 0.0,
+                        "query_coverage": "partial",
+                        "continue_research": False,
+                        "replan_required": False,
+                        "reflexion_triggered": False,
+                        "knowledge_gaps": [],
+                        "quality_issues": [],
+                        "stop_reason": "quick mode",
+                        "refined_queries": [],
+                    },
+                    agent_name=self.name,
+                    metadata={
+                        "iteration": iteration,
+                        "continue_research": False,
+                        "num_refined_queries": 0,
+                        "quality_score": 0.0,
+                    },
+                )
+
+            # Generate critique
+            self.log(f"Critiquing iteration {iteration}")
+            critique = self.critique(query, findings, iteration)
+            critique["reflexion_triggered"] = False
+            
+            # Determine if we should continue
+            should_continue = self.should_continue(critique, iteration)
+            
+            # Generate refined queries if continuing
+            refined_queries = []
+            if should_continue:
+                gaps = critique.get("knowledge_gaps", [])
+                refined_queries = self.generate_refined_queries(
+                    query, gaps, previous_queries
+                )
+                critique["refined_queries"] = refined_queries
+            
+            # Update context if available
+            if self.context and self.context.current_session_id:
+                for gap in critique.get("knowledge_gaps", []):
+                    self.context.add_knowledge_gap(gap)
+                self.context.increment_iteration()
+            
+            return AgentResult(
+                success=True,
+                content=critique,
+                agent_name=self.name,
+                metadata={
+                    "iteration": iteration,
+                    "continue_research": should_continue,
+                    "num_refined_queries": len(refined_queries),
+                    "quality_score": critique.get("overall_quality", 0),
+                },
+            )
+        
+        except Exception as e:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name=self.name,
+                error=str(e),
+            )
