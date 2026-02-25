@@ -174,3 +174,180 @@ export function ArchitecturePlanDisplay({
                                 <div className="space-y-2">
                                     {architecture.technology_stack.slice(0, 5).map((tech, idx) => (
                                         <div key={idx} className="text-sm text-zinc-300">
+                                            <p className="font-semibold text-white">{tech.component}</p>
+                                            <p className="text-xs text-zinc-500">{tech.technology}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </Card>
+
+                        <h3 className="text-lg font-bold text-white">Core Components</h3>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                            {architecture.components.slice(0, 6).map((comp, idx) => (
+                                <Card key={idx} className="bg-black/50 border-white/10 p-3 rounded-xl">
+                                    <h4 className="font-bold text-white text-sm mb-1">{comp.name}</h4>
+                                    <p className="text-xs text-zinc-400 mb-2">{comp.purpose}</p>
+                                    <p className="text-xs text-zinc-500">
+                                        <strong className="text-zinc-400">Tech:</strong> {comp.technology}
+                                    </p>
+                                    <p className="text-xs text-zinc-500">
+                                        <strong className="text-zinc-400">SLA:</strong> {comp.sla?.latency_p99 || comp.sla?.availability}
+                                    </p>
+                                </Card>
+                            ))}
+                        </div>
+                    </div>
+                )}
+
+                {/* Costs Tab */}
+                {activeTab === "costs" && (
+                    <div className="mt-6">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <Card className="bg-black/50 border-white/10 rounded-xl">
+                                <div className="p-4">
+                                    <h3 className="font-bold text-white mb-3">Monthly Costs</h3>
+                                    <div className="space-y-2">
+                                        <div className="flex justify-between text-sm text-zinc-400">
+                                            <span>LLM & Models</span>
+                                            <span className="text-white font-semibold">${llmCost}</span>
+                                        </div>
+                                        <div className="flex justify-between text-sm text-zinc-400">
+                                            <span>Infrastructure</span>
+                                            <span className="text-white font-semibold">${infraCost}</span>
+                                        </div>
+                                        <div className="h-px bg-white/10 my-2" />
+                                        <div className="flex justify-between text-base font-bold text-white">
+                                            <span>Total</span>
+                                            <span>${totalMonthlyCost}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </Card>
+                        </div>
+                    </div>
+                )}
+
+                {/* Risks Tab */}
+                {activeTab === "risks" && (
+                    <div className="mt-6">
+                        <h3 className="text-lg font-bold text-white mb-3">Production Risks & Mitigation</h3>
+                        <div className="space-y-2">
+                            {architecture.risk_mitigation.slice(0, 4).map((risk, idx) => (
+                                <Card
+                                    key={idx}
+                                    className="bg-black/50 border-white/10 p-3 cursor-pointer hover:bg-white/5 rounded-xl transition-colors"
+                                    onClick={() => setExpandedRisk(expandedRisk === idx ? null : idx)}
+                                >
+                                    <div className="flex items-start justify-between">
+                                        <div>
+                                            <h4 className="font-bold text-white text-sm">{risk.risk}</h4>
+                                            <p className="text-xs text-zinc-500 mt-1">
+                                                <strong className="text-zinc-400">Probability:</strong> {risk.probability} | <strong className="text-zinc-400">RTO:</strong> {risk.rto}
+                                            </p>
+                                        </div>
+                                        <span className="text-xl text-zinc-500">
+                                            {expandedRisk === idx ? "−" : "+"}
+                                        </span>
+                                    </div>
+                                    {expandedRisk === idx && (
+                                        <div className="mt-3 pt-3 border-t border-white/10">
+                                            <p className="text-xs text-zinc-300 mb-2">
+                                                <strong className="text-zinc-400">Impact:</strong> {risk.impact}
+                                            </p>
+                                            <p className="text-xs text-zinc-400">
+                                                <strong>Mitigation:</strong>
+                                            </p>
+                                            <ul className="list-disc list-inside text-xs text-zinc-500 mt-1">
+                                                {risk.mitigation.map((m, midx) => (
+                                                    <li key={midx}>{m}</li>
+                                                ))}
+                                            </ul>
+                                        </div>
+                                    )}
+                                </Card>
+                            ))}
+                        </div>
+                    </div>
+                )}
+            </div>
+
+            {/* Deployment Runbook */}
+            <div className="bg-black/50 border border-white/10 p-4 rounded-xl">
+                <h3 className="text-lg font-bold text-white mb-3">Deployment Guide</h3>
+                <div className="space-y-3">
+                    <p className="text-sm text-zinc-400">
+                        Generate a deployment runbook for your target cloud platform:
+                    </p>
+                    <div className="flex gap-2">
+                        {["gcp", "aws", "azure"].map((cloud) => (
+                            <button
+                                key={cloud}
+                                onClick={() => setSelectedCloud(cloud)}
+                                className={`px-3 py-1.5 text-sm font-medium rounded-lg uppercase transition-colors ${
+                                    selectedCloud === cloud
+                                        ? "bg-white/15 text-white border border-white/30"
+                                        : "text-zinc-400 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10"
+                                }`}
+                            >
+                                {cloud}
+                            </button>
+                        ))}
+                    </div>
+                    <button
+                        onClick={() => onGenerateRunbook?.(selectedCloud)}
+                        className="w-full py-2.5 bg-white/10 hover:bg-white/15 text-white font-medium rounded-xl border border-white/10 transition-colors"
+                    >
+                        Generate {selectedCloud.toUpperCase()} Runbook
+                    </button>
+                </div>
+            </div>
+
+            {/* Scalability Roadmap */}
+            <div>
+                <h3 className="text-lg font-bold text-white mb-3">Scalability Roadmap</h3>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {Object.entries(architecture.scalability_strategy)
+                        .filter(([key]) => key.includes("phase"))
+                        .map(([phase, details]: [string, any], idx) => (
+                            <Card key={idx} className="bg-black/50 border-white/10 p-3 rounded-xl">
+                                <h4 className="font-bold text-white text-sm mb-2 capitalize">
+                                    {phase.replace(/_/g, " ")}
+                                </h4>
+                                <div className="text-xs text-zinc-400 space-y-1">
+                                    {typeof details === "object" &&
+                                        Object.entries(details)
+                                            .slice(0, 3)
+                                            .map(([key, val]: [string, any], vidx) => (
+                                                <div key={vidx}>
+                                                    <strong className="text-zinc-500">{key.replace(/_/g, " ")}:</strong>
+                                                    <p className="text-zinc-600 line-clamp-1">
+                                                        {typeof val === "string" ? val : JSON.stringify(val).substring(0, 50)}
+                                                    </p>
+                                                </div>
+                                            ))}
+                                </div>
+                            </Card>
+                        ))}
+                </div>
+            </div>
+
+            {/* Call to Action */}
+            <div className="bg-black/50 border border-white/10 p-4 rounded-xl text-center">
+                <p className="text-sm text-zinc-400 mb-3">
+                    Ready to deploy? Generate a detailed runbook and start building production infrastructure.
+                </p>
+                <div className="flex gap-2 justify-center flex-wrap">
+                    <button className="px-4 py-2 bg-white/10 hover:bg-white/15 text-white font-medium rounded-lg border border-white/10 transition-colors text-sm">
+                        Download Architecture PDF
+                    </button>
+                    <button className="px-4 py-2 text-zinc-400 hover:text-white hover:bg-white/5 font-medium rounded-lg border border-white/10 transition-colors text-sm">
+                        Share with Team
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+}
+
+export default ArchitecturePlanDisplay;
