@@ -313,3 +313,318 @@ JSON goals:"""
     
     def _expand_goal(
         self,
+        goal: Dict[str, Any],
+        original_query: str,
+        top_k: int,
+    ) -> List[TaskNode]:
+        """
+        Expand a goal into concrete task nodes.
+        
+        Args:
+            goal: Goal dictionary with focus, search_types, etc.
+            original_query: Original research query
+            
+        Returns:
+            List of TaskNodes
+        """
+        tasks = []
+        focus = goal.get("focus", "")
+        search_types = goal.get("search_types", ["web"])
+        priority = goal.get("priority", 2)
+        depth = goal.get("depth", "shallow")
+        
+        # Calculate budget based on priority and depth
+        base_budget = 5000 if depth == "shallow" else 10000
+        budget = base_budget // priority
+        
+        # Create search tasks for each type
+        for search_type in search_types:
+            task_type = {
+                "web": TaskType.SEARCH_WEB,
+                "academic": TaskType.SEARCH_ACADEMIC,
+                "technical": TaskType.SEARCH_TECHNICAL,
+            }.get(search_type, TaskType.SEARCH_WEB)
+            
+            # Generate focused query
+            search_query = f"{original_query} {focus}" if focus else original_query
+            
+            task = TaskNode(
+                type=task_type,
+                input={
+                    "query": search_query,
+                    "focus": focus,
+                    "num_results": min(top_k, 8) if depth == "deep" else min(top_k, 5),
+                },
+                dependencies=[],  # Search tasks have no deps
+                budget_ms=budget,
+                model_hint=ModelTier.SMALL if depth == "shallow" else ModelTier.MEDIUM,
+                preferred_agent={
+                    "web": "WebSearchAgent",
+                    "academic": "AcademicSearchAgent",
+                    "technical": "TechnicalSearchAgent",
+                }.get(search_type, "WebSearchAgent"),
+            )
+            tasks.append(task)
+        
+        return tasks
+    
+    def replan(
+        self,
+        task_graph: TaskGraph,
+        reflexion_feedback: Dict[str, Any],
+        preferences: Optional[Dict[str, Any]] = None,
+    ) -> TaskGraph:
+        """
+        Update task graph based on reflexion feedback.
+        
+        Adds new search tasks to fill identified gaps.
+        
+        Args:
+            task_graph: Current task graph
+            reflexion_feedback: Feedback from reflexion agent
+            
+        Returns:
+            Updated TaskGraph
+        """
+        prefs = preferences or {}
+        quick_mode = prefs.get("mode") == "quick"
+
+        if quick_mode:
+            return task_graph
+        if not reflexion_feedback.get("replan_required", False):
+            return task_graph
+        
+        # Increment iteration
+        task_graph.current_iteration += 1
+        
+        # Get refined queries from feedback
+        refined_queries = reflexion_feedback.get("refined_queries", [])
+        knowledge_gaps = reflexion_feedback.get("knowledge_gaps", [])
+        priority_focus = reflexion_feedback.get("priority_focus", "")
+        
+        # Find the reflexion task to add new dependencies
+        reflexion_tasks = [
+            n for n in task_graph.nodes.values()
+            if n.type == TaskType.REFLEXION and n.status != TaskStatus.COMPLETE
+        ]
+        
+        new_search_ids = []
+        
+        # Add new search tasks for gaps (limit to 2 to avoid blowup)
+        for i, gap in enumerate(knowledge_gaps[:2]):
+            # Determine search type based on gap content
+            search_type = TaskType.SEARCH_WEB
+            if any(term in gap.lower() for term in ["paper", "research", "study", "academic"]):
+                search_type = TaskType.SEARCH_ACADEMIC
+            elif any(term in gap.lower() for term in ["code", "implementation", "github", "technical"]):
+                search_type = TaskType.SEARCH_TECHNICAL
+            
+            task = TaskNode(
+                type=search_type,
+                input={
+                    "query": refined_queries[i] if i < len(refined_queries) else gap,
+                    "focus": gap,
+                    "num_results": 3,
+                    "iteration": task_graph.current_iteration,
+                },
+                dependencies=[],
+                budget_ms=5000,
+                model_hint=ModelTier.MEDIUM,
+            )
+            task_graph.add_node(task)
+            new_search_ids.append(task.id)
+        
+        # Add new extraction task for new searches
+        if new_search_ids:
+            extract_task = TaskNode(
+                type=TaskType.EXTRACT_CLAIMS,
+                input={"iteration": task_graph.current_iteration},
+                dependencies=new_search_ids,
+                budget_ms=3000,
+                model_hint=ModelTier.SMALL,
+            )
+            task_graph.add_node(extract_task)
+            
+            # Add new validation task
+            validate_task = TaskNode(
+                type=TaskType.VALIDATE_CLAIMS,
+                input={"iteration": task_graph.current_iteration},
+                dependencies=[extract_task.id],
+                budget_ms=5000,
+                model_hint=ModelTier.MEDIUM,
+            )
+            task_graph.add_node(validate_task)
+            
+            # Add new reflexion task
+            if not quick_mode:
+                new_reflexion = TaskNode(
+                    type=TaskType.REFLEXION,
+                    input={"iteration": task_graph.current_iteration},
+                    dependencies=[validate_task.id],
+                    budget_ms=5000,
+                    model_hint=ModelTier.MEDIUM,
+                )
+                task_graph.add_node(new_reflexion)
+                
+                # Update synthesis to depend on new reflexion
+                for node in task_graph.nodes.values():
+                    if node.type == TaskType.SYNTHESIZE_REPORT:
+                        node.dependencies = [new_reflexion.id]
+        
+        return task_graph
+    
+    def plan_from_llm(
+        self,
+        query: str,
+        preferences: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> TaskGraph:
+        """
+        Use LLM to generate the complete task graph.
+        
+        More flexible than hierarchical_plan but slower.
+        
+        Args:
+            query: Research query
+            preferences: User preferences
+            session_id: Session ID
+            
+        Returns:
+            TaskGraph generated by LLM
+        """
+        prefs = preferences or {}
+        
+        prompt = f"""{self.system_prompt}
+
+Research Query: {query}
+
+Preferences:
+- Max time: {prefs.get('max_time_ms', 180000)}ms
+- Depth: {prefs.get('depth', 'balanced')}
+- Focus areas: {prefs.get('focus_areas', 'general')}
+
+Generate a task graph as JSON:"""
+
+        try:
+            response = self.llm.chat(
+                messages=[{"role": "user", "content": prompt}],
+                model="fast",
+                temperature=0.3,
+                max_tokens=2000,
+            )
+            
+            content = response.content.strip()
+            
+            # Extract JSON
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            data = json.loads(content)
+            
+            # Build graph from LLM output
+            graph = TaskGraph(session_id=session_id)
+            
+            if "goal_criteria" in data:
+                graph.goal_criteria = GoalCriteria.from_dict(data["goal_criteria"])
+            
+            for node_data in data.get("nodes", []):
+                # Map string type to enum
+                type_str = node_data.get("type", "search.web")
+                try:
+                    task_type = TaskType(type_str)
+                except ValueError:
+                    task_type = TaskType.SEARCH_WEB
+                
+                # Map model hint
+                hint_str = node_data.get("model_hint", "medium")
+                try:
+                    model_hint = ModelTier(hint_str)
+                except ValueError:
+                    model_hint = ModelTier.MEDIUM
+                
+                node = TaskNode(
+                    id=node_data.get("id", None) or str(uuid.uuid4()),
+                    type=task_type,
+                    input=node_data.get("input", {}),
+                    dependencies=node_data.get("deps", node_data.get("dependencies", [])),
+                    budget_ms=node_data.get("budget_ms", 5000),
+                    model_hint=model_hint,
+                )
+                graph.add_node(node)
+            
+            return graph
+            
+        except Exception as e:
+            self.log(f"LLM planning failed: {e}, using default plan")
+            return self.hierarchical_plan(query, preferences, session_id)
+    
+    def execute(self, input_data: Dict[str, Any]) -> AgentResult:
+        """
+        Execute the hierarchical planner.
+        
+        Args:
+            input_data: Must contain 'query', optionally 'action', 'preferences'
+            
+        Returns:
+            AgentResult with task graph
+        """
+        query = input_data.get("query", "")
+        action = input_data.get("action", "plan")
+        preferences = input_data.get("preferences", {})
+        session_id = input_data.get("session_id")
+        
+        if not query and action != "replan":
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name="HierarchicalPlannerAgent",
+                error="Query is required",
+            )
+        
+        try:
+            if action == "plan":
+                task_graph = self.hierarchical_plan(query, preferences, session_id)
+            elif action == "plan_llm":
+                task_graph = self.plan_from_llm(query, preferences, session_id)
+            elif action == "replan":
+                existing_graph = input_data.get("task_graph")
+                feedback = input_data.get("reflexion_feedback", {})
+                if not existing_graph:
+                    return AgentResult(
+                        success=False,
+                        content=None,
+                        agent_name="HierarchicalPlannerAgent",
+                        error="task_graph required for replan",
+                    )
+                task_graph = self.replan(existing_graph, feedback)
+            else:
+                return AgentResult(
+                    success=False,
+                    content=None,
+                    agent_name="HierarchicalPlannerAgent",
+                    error=f"Unknown action: {action}",
+                )
+            
+            return AgentResult(
+                success=True,
+                content=task_graph.to_dict(),
+                agent_name="HierarchicalPlannerAgent",
+                metadata={
+                    "node_count": len(task_graph.nodes),
+                    "execution_order": task_graph.get_execution_order(),
+                },
+            )
+            
+        except Exception as e:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name="HierarchicalPlannerAgent",
+                error=str(e),
+            )
+
+
+# Import uuid for node ID generation
+import uuid
