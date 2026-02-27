@@ -457,3 +457,463 @@ class DeepResearchOrchestratorV2:
                     "phases": phases,
                 },
                 on_progress=lambda ctx: self._propagate_phases(ctx.get("phases", [])),
+            )
+            phases = context.get("phases", phases)
+            self.log(f"Execution complete: {context.get('execution_stats', {})}")
+
+            # Mark phases that were never activated as "skipped"
+            for p in phases:
+                if p["status"] == "pending" and p["id"] not in ("synthesis",):
+                    p["status"] = "skipped"
+                    p["log_entries"].append("No tasks for this phase")
+            self._propagate_phases(phases)
+            
+            # Check if replanning is needed (skip in quick mode)
+            reflexion_result = context.get("reflexion_result")
+            reflexion_triggered = False
+            if not quick_mode and reflexion_result and reflexion_result.content and reflexion_result.content.get("replan_required", False):
+                self.log("Replanning based on reflexion feedback...")
+                reflexion_triggered = True
+                task_graph = self.hierarchical_planner.replan(
+                    task_graph=task_graph,
+                    reflexion_feedback=reflexion_result.content,
+                    preferences=prefs,
+                )
+                
+                # Re-execute with updated graph
+                context = await self.executor.execute_graph(
+                    task_graph=task_graph,
+                    initial_context=context,
+                )
+            
+            # Build or merge evidence graph from findings
+            self.log("Building evidence graph...")
+            await self._build_evidence_graph(context)
+            
+            # Extract claims
+            self.log("Extracting claims...")
+            claims = context.get("claims", [])
+            sources = context.get("validated_findings", [])
+            if not sources:
+                if quick_mode:
+                    self.log("Quick mode: validation skipped, using raw findings")
+                else:
+                    self.log("No validated findings found, falling back to raw findings")
+                sources = context.get("findings", [])
+            
+            # Synthesis phase
+            synth_phase = next((p for p in phases if p["id"] == "synthesis"), None)
+            if synth_phase and synth_phase["status"] == "pending":
+                synth_phase["status"] = "active"
+                synth_phase["started_at"] = time.time()
+                self._propagate_phases(phases)
+
+            # Generate final report
+            self.log("Synthesizing report...")
+            # Inject user preferences and memory context into synthesis
+            synthesis_prefs = dict(prefs)
+            if user_prefs_context:
+                synthesis_prefs["user_prefs_context"] = user_prefs_context
+            if memory_context:
+                synthesis_prefs["memory_context"] = memory_context
+            report = await self._synthesize_report(query, claims, sources, synthesis_prefs)
+
+            if synth_phase and synth_phase["status"] == "active":
+                synth_phase["status"] = "complete"
+                synth_phase["completed_at"] = time.time()
+                if synth_phase["started_at"]:
+                    synth_phase["elapsed_seconds"] = round(
+                        synth_phase["completed_at"] - synth_phase["started_at"], 1
+                    )
+                self._propagate_phases(phases)
+            
+            # Store memories if enabled
+            if self.memory_api and session:
+                self.log("Storing memories...")
+                try:
+                    self.memory_api.store_research_findings(
+                        session_id=session.id,
+                        query=query,
+                        findings=sources,
+                        user_id=prefs.get("user_id"),
+                    )
+                except Exception as store_err:
+                    self.log(f"Memory storage failed (non-fatal): {store_err}")
+            
+            # Build result
+            usage_after = self.llm_client.get_usage_stats()
+            latency_seconds = max(0.0, time.time() - start_time)
+            prompt_tokens = usage_after.get("prompt_tokens", 0) - usage_before.get("prompt_tokens", 0)
+            completion_tokens = usage_after.get("completion_tokens", 0) - usage_before.get("completion_tokens", 0)
+            estimated_cost = usage_after.get("estimated_cost_usd", 0.0) - usage_before.get("estimated_cost_usd", 0.0)
+            model_usage_before = usage_before.get("model_usage_breakdown", {})
+            model_usage_after = usage_after.get("model_usage_breakdown", {})
+            model_usage_breakdown = {
+                provider: model_usage_after.get(provider, 0) - model_usage_before.get(provider, 0)
+                for provider in model_usage_after
+            }
+            task_graph_stats = self._compute_task_graph_stats(task_graph)
+
+            result = ResearchResultV2(
+                query=query,
+                report=report,
+                sources=[self._format_source(s) for s in sources],
+                claims=claims,
+                evidence_graph=self.evidence_graph.to_dict(),
+                metadata={
+                    "search_provider": self.search_provider,
+                    "session_id": session.id if session else None,
+                    "metrics": {
+                        "mode": mode,
+                        "latency": latency_seconds,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "cost_estimate": estimated_cost,
+                        "models_used": model_usage_breakdown,
+                        "task_graph": task_graph_stats,
+                    },
+                    "reflexion": {
+                        "triggered": reflexion_triggered,
+                    },
+                    "phases": phases,
+                },
+                iterations=task_graph.current_iteration,
+                task_graph=task_graph.to_dict(),
+                execution_stats=context.get("execution_stats", {}),
+            )
+            
+            self.log("Research complete!")
+            return result
+            
+        except Exception as e:
+            self.log(f"Pipeline error: {e}")
+            return self._error_result(query, str(e))
+    
+    def research(
+        self,
+        query: str,
+        preferences: Optional[Dict[str, Any]] = None,
+        previous_context: Optional[Dict[str, Any]] = None,
+    ) -> ResearchResultV2:
+        """
+        Execute research synchronously (wrapper for async).
+        
+        Args:
+            query: Research query
+            preferences: Optional preferences
+            
+        Returns:
+            ResearchResultV2
+        """
+        return asyncio.run(self.research_async(query, preferences, previous_context=previous_context))
+    
+    async def _build_evidence_graph(self, context: Dict[str, Any]) -> None:
+        """Build evidence graph from context.
+
+        Sources get their graph-level IDs assigned here.  Claims produced
+        by the extractor carry ``source_url`` but **not** ``source_id``
+        because IDs don't exist yet at extraction time.  We therefore
+        build a URL→ID mapping and resolve claim→source links via URL
+        matching so evidence edges (supports / mentions) are created.
+
+        If the claim extractor returned no claims (e.g. LLM rate-limits),
+        we fall back to ``key_claims`` stored inside each validated
+        finding's ``validation`` dict by the SourceValidatorAgent.
+        """
+        # Reset the graph so stale edges from earlier pipeline steps
+        # (e.g. source_validator running before IDs exist) are cleared.
+        self.evidence_graph = EvidenceGraph()
+
+        sources = context.get("validated_findings", [])
+        if not sources:
+            # Fallback to raw findings (quick mode or validation skipped)
+            sources = context.get("findings", [])
+        claims = context.get("claims", [])
+
+        # ── 1. Add sources & build URL → source_id map ─────────────────
+        url_to_source_id: Dict[str, str] = {}
+        source_id_to_data: Dict[str, Dict] = {}
+        for source_data in sources:
+            source = Source(
+                url=source_data.get("url", source_data.get("source", "")),
+                title=source_data.get("title", ""),
+                text_excerpt=source_data.get("content", source_data.get("text", ""))[:2000],
+                reliability_score=source_data.get("reliability_score", 0.5),
+            )
+            self.evidence_graph.add_source(source)
+            source_data["id"] = source.id
+            url = source_data.get("url", source_data.get("source", ""))
+            if url:
+                url_to_source_id[url] = source.id
+            source_id_to_data[source.id] = source_data
+
+        # ── 2. Add claims & link to sources via URL matching ───────────
+        #       Primary source: claim extractor output
+        #       Fallback 1: key_claims from source validation results
+        #       Fallback 2: synthesize minimal claims from source titles
+        if not claims:
+            self.log("No claims from extractor – using validation key_claims as fallback")
+            claims = self._claims_from_validation(sources)
+
+        if not claims:
+            self.log("No key_claims from validation – synthesizing claims from source titles")
+            claims = self._claims_from_source_titles(sources)
+
+        for claim_data in claims:
+            claim_payload = {
+                "text": claim_data.get("claim", claim_data.get("text", "")),
+                "normalized_text": claim_data.get("normalized_text", ""),
+                "confidence": claim_data.get("confidence", 0.5),
+                "supporting_text": claim_data.get("supporting_text", ""),
+            }
+            claim = Claim.from_dict(claim_payload)
+            self.evidence_graph.add_claim(claim)
+
+            # Resolve source_id: try direct ID first, then URL matching
+            source_id = claim_data.get("source_id") or ""
+            if not source_id:
+                source_url = claim_data.get("source_url", "")
+                source_id = url_to_source_id.get(source_url, "")
+
+            if source_id:
+                # Only mark SUPPORTS when the source was *actually* validated
+                # by the SourceValidatorAgent and proved reliable.  In quick
+                # mode (no validation step) every edge stays MENTIONS so the
+                # trust-panel honestly shows 0 verified claims.
+                src_data = source_id_to_data.get(source_id, {})
+                was_validated = bool(src_data.get("validation"))
+                reliability = src_data.get("reliability_score", 0.5)
+                claim_conf = claim_data.get("confidence", 0.5)
+
+                if was_validated and reliability >= 0.7:
+                    relation = EvidenceRelation.SUPPORTS
+                    strength = round(claim_conf * reliability, 3)
+                else:
+                    relation = EvidenceRelation.MENTIONS
+                    strength = round(claim_conf * 0.4, 3)
+
+                self.evidence_graph.add_evidence(
+                    claim_id=claim.id,
+                    source_id=source_id,
+                    relation=relation,
+                    strength=strength,
+                )
+
+    @staticmethod
+    def _claims_from_validation(
+        sources: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Build a claims list from validation ``key_claims`` stored in each finding.
+
+        This is the fallback when the dedicated claim-extractor task returned
+        no claims (e.g. all LLM calls hit rate-limits).
+        """
+        claims: List[Dict[str, Any]] = []
+        for src in sources:
+            val = src.get("validation", {})
+            source_url = src.get("url", src.get("source", ""))
+            reliability = val.get("reliability_score", src.get("reliability_score", 0.5))
+            for claim_text in val.get("key_claims", []):
+                claims.append({
+                    "claim": claim_text,
+                    "text": claim_text,
+                    "confidence": reliability,
+                    "source_url": source_url,
+                    "source_id": src.get("id", ""),
+                    "supporting_text": "",
+                })
+        return claims
+
+    @staticmethod
+    def _claims_from_source_titles(
+        sources: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Last-resort fallback: create one claim per source from its title.
+
+        When both the claim extractor and validation key_claims are empty,
+        this ensures the evidence graph still has claim-source edges so the
+        visual graph renders which claims came from which source.
+        """
+        claims: List[Dict[str, Any]] = []
+        for src in sources:
+            title = src.get("title", "").strip()
+            content = src.get("content", src.get("text", "")).strip()
+            if not title and not content:
+                continue
+            # Use the title as claim text; fall back to first sentence of content
+            if title:
+                claim_text = title
+            else:
+                claim_text = content.split(".")[0].strip()
+                if claim_text and not claim_text.endswith("."):
+                    claim_text += "."
+            source_url = src.get("url", src.get("source", ""))
+            claims.append({
+                "claim": claim_text,
+                "text": claim_text,
+                "confidence": 0.4,
+                "source_url": source_url,
+                "source_id": src.get("id", ""),
+                "supporting_text": content[:500] if content else "",
+            })
+        return claims
+
+    async def _synthesize_report(
+        self,
+        query: str,
+        claims: List[Dict[str, Any]],
+        sources: List[Dict[str, Any]],
+        preferences: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Generate the final research report."""
+        prefs = preferences or {}
+        # Get claim provenance from evidence graph
+        claims_with_evidence = []
+        for claim_data in claims:
+            evidence = self.evidence_graph.get_claim_provenance(claim_data.get("id", ""))
+            if evidence:
+                claims_with_evidence.append(evidence)
+            else:
+                claims_with_evidence.append(claim_data)
+
+        # Build enriched query with user preferences for synthesis
+        synthesis_query = query
+        enrichment_parts = []
+        if prefs.get("user_prefs_context"):
+            enrichment_parts.append(prefs["user_prefs_context"])
+        if prefs.get("memory_context"):
+            enrichment_parts.append(prefs["memory_context"])
+        if enrichment_parts:
+            synthesis_query = query + "\n\n" + "\n".join(enrichment_parts)
+
+        # Use master planner for synthesis with output control
+        result = self.master_planner.synthesize_findings(
+            query=synthesis_query,
+            findings=sources,
+            format_type="markdown",
+            output_mode=prefs.get("output_mode", "deep"),
+            audience=prefs.get("audience", "myself"),
+            expertise_level=prefs.get("expertise_level", "intermediate"),
+        )
+        
+        # Add evidence section
+        evidence_section = self._format_evidence_section(claims_with_evidence)
+        
+        if isinstance(result, str):
+            return result + "\n\n" + evidence_section
+        return result.get("report", str(result)) + "\n\n" + evidence_section
+    
+    def _format_evidence_section(self, claims: List[Dict[str, Any]]) -> str:
+        """Format the evidence trail section."""
+        if not claims:
+            return ""
+        
+        lines = ["\n## Evidence Trail\n"]
+        lines.append("The following claims are supported by the evidence graph:\n")
+        
+        for i, claim in enumerate(claims[:10], 1):  # Limit to 10
+            claim_text = claim.get("claim_text", claim.get("claim", ""))
+            confidence = claim.get("confidence", claim.get("aggregated_confidence", 0))
+            
+            lines.append(f"\n### Claim {i}")
+            lines.append(f"> {claim_text}")
+            lines.append(f"\n**Confidence:** {confidence:.2f}")
+            
+            supporting = claim.get("supporting_sources", [])
+            if supporting:
+                lines.append("\n**Supporting Sources:**")
+                for source in supporting[:3]:
+                    if isinstance(source, dict):
+                        lines.append(f"- [{source.get('title', 'Source')}]({source.get('url', '')})")
+        
+        return "\n".join(lines)
+    
+    def _format_source(self, source: Dict[str, Any]) -> Dict[str, Any]:
+        """Format source for output."""
+        return {
+            "url": source.get("url", source.get("source", "")),
+            "title": source.get("title", ""),
+            "content": source.get("content", source.get("text", ""))[:500],
+            "reliability_score": source.get("reliability_score", 0.5),
+            "id": source.get("id", ""),
+        }
+    
+    def _error_result(self, query: str, error: str) -> ResearchResultV2:
+        """Generate an error result."""
+        return ResearchResultV2(
+            query=query,
+            report=f"# Research Failed\n\nError: {error}",
+            sources=[],
+            claims=[],
+            evidence_graph={},
+            metadata={"error": error},
+            iterations=0,
+            task_graph={},
+            execution_stats={},
+        )
+    
+    def save_result(self, result: ResearchResultV2, filepath: str) -> None:
+        """Save research result to file."""
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump({
+                "query": result.query,
+                "report": result.report,
+                "sources": result.sources,
+                "claims": result.claims,
+                "evidence_graph": result.evidence_graph,
+                "metadata": result.metadata,
+                "iterations": result.iterations,
+                "task_graph": result.task_graph,
+                "execution_stats": result.execution_stats,
+                "created_at": result.created_at,
+            }, f, indent=2, default=str)
+        self.log(f"Result saved to {filepath}")
+    
+    def shutdown(self):
+        """Shutdown the orchestrator."""
+        self.executor.shutdown()
+
+
+def main():
+    """Run a sample V2 research query."""
+    print("=" * 60)
+    print("Deep Research Agent V2")
+    print("=" * 60)
+    
+    orchestrator = DeepResearchOrchestratorV2(
+        search_provider="exa",
+        max_iterations=3,
+        verbose=True,
+        use_memory=False,  # Set to True when Firebase Firestore configured
+    )
+    
+    query = "What are the latest advancements in AI agent architectures in 2024?"
+    
+    print(f"\nResearch Query: {query}\n")
+    print("-" * 60)
+    
+    result = orchestrator.research(query)
+    
+    print("\n" + "=" * 60)
+    print("RESEARCH REPORT")
+    print("=" * 60)
+    print(result.report)
+    
+    print("\n" + "-" * 60)
+    print("EXECUTION STATS")
+    print("-" * 60)
+    print(json.dumps(result.execution_stats, indent=2))
+    
+    print("\n" + "-" * 60)
+    print(f"Claims extracted: {len(result.claims)}")
+    print(f"Sources used: {len(result.sources)}")
+    print(f"Iterations: {result.iterations}")
+    
+    # Save result
+    orchestrator.save_result(result, "research_result_v2.json")
+    
+    orchestrator.shutdown()
+
+
+if __name__ == "__main__":
+    main()

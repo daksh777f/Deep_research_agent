@@ -721,3 +721,726 @@ async def run_research_task_async(
             "reflexion_iterations": reflexion_iters,
             "output_mode_used": output_mode,
         }
+        final_data["research_metrics"] = research_metrics
+
+        # 6d. Extract claims array for claim-level expanders
+        claims = _extract_claims(result.evidence_graph, result.sources)
+        final_data["claims"] = claims
+
+        # 6e. Generate research gaps for honesty section
+        research_gaps = _generate_research_gaps(result.evidence_graph, result.report)
+        final_data["research_gaps"] = research_gaps
+
+        # 6f. Generate continuation suggestions
+        continuations = _generate_continuations(query, result.report, result.evidence_graph)
+        final_data["continuations"] = continuations
+
+        # 6g. Part 4: Comparison mode synthesis
+        session_state = active_sessions.get(session_id, {})
+        is_comparison = session_state.get("comparison_mode", False)
+        subject_a = session_state.get("subject_a", "")
+        subject_b = session_state.get("subject_b", "")
+
+        if is_comparison and subject_a and subject_b:
+            try:
+                from src.agents.comparison_synthesizer import ComparisonSynthesizer
+                from src.core.llm_client import LLMClient as _LLMClient
+
+                comp_llm = _LLMClient()
+                synthesizer = ComparisonSynthesizer(llm_client=comp_llm)
+
+                # The main report covers both subjects; split heuristically
+                # or just pass the full report for both sides
+                comparison_result = await synthesizer.synthesize(
+                    subject_a=subject_a,
+                    subject_b=subject_b,
+                    report_a=result.report,
+                    report_b=result.report,
+                    sources_a=result.sources,
+                    sources_b=result.sources,
+                    evidence_graph_a=result.evidence_graph,
+                    evidence_graph_b=result.evidence_graph,
+                )
+                final_data["comparison"] = comparison_result
+                print(f"  ✅ Comparison synthesized: {comparison_result.get('verdict', 'N/A')}")
+            except Exception as comp_err:
+                print(f"  ⚠️ Comparison synthesis failed: {comp_err}")
+                final_data["comparison"] = None
+        else:
+            final_data["comparison"] = None
+
+        # 6h. Part 4: Store evidence graph for /graph endpoint
+        final_data["evidence_graph_raw"] = result.evidence_graph
+
+        # 7. Update in-memory
+        if session_id in active_sessions:
+            active_sessions[session_id]["status"] = "completed"
+            active_sessions[session_id]["result"] = final_data
+            active_sessions[session_id]["phases"] = result.metadata.get("phases", [])
+
+        # 8. Persist to Firestore (skip if unavailable)
+        if _firestore_db is not None:
+            try:
+                evidence_summary = {
+                    "sources": result.sources,
+                    "evidence_graph": result.evidence_graph,
+                }
+                task_graph_summary = result.task_graph
+
+                await _run_in_executor(
+                    store.save_results,
+                    session_id,
+                    result.report,
+                    evidence_summary,
+                    task_graph_summary,
+                )
+
+                metrics = result.metadata.get("metrics", {})
+                metrics_payload = {
+                    "latency_ms": int(metrics.get("latency", 0) * 1000),
+                    "prompt_tokens": metrics.get("prompt_tokens", 0),
+                    "completion_tokens": metrics.get("completion_tokens", 0),
+                    "total_cost": metrics.get("cost_estimate", 0.0),
+                    "model_used": str(metrics.get("models_used", {})),
+                    "mode": mode,
+                }
+                await _run_in_executor(store.save_metrics, session_id, metrics_payload)
+
+                print(f"✅ Session {session_id} saved to Firestore")
+            except Exception as e:
+                print(f"⚠️ Firestore persistence failed for {session_id}: {e}")
+        else:
+            print(f"ℹ️ Session {session_id} completed (in-memory only)")
+
+    except Exception as e:
+        print(f"❌ Error in task {session_id}: {e}")
+        if session_id in active_sessions:
+            active_sessions[session_id]["status"] = "failed"
+            active_sessions[session_id]["error"] = str(e)
+
+        if _firestore_db is not None:
+            try:
+                await _run_in_executor(store.update_session_status, session_id, "failed")
+            except Exception:
+                pass
+
+
+def run_research_task_wrapper(
+    session_id: str,
+    query: str,
+    max_iterations: int,
+    search_provider: str,
+    mode: str,
+    user_id: Optional[str] = None,
+    output_mode: str = "deep",
+    audience: str = "myself",
+    expertise_level: str = "intermediate",
+):
+    """Sync wrapper for BackgroundTasks."""
+    asyncio.run(
+        run_research_task_async(
+            session_id, query, max_iterations, search_provider, mode, user_id,
+            output_mode, audience, expertise_level,
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# API Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/research", response_model=ResearchResponse)
+async def start_research(
+    request: ResearchRequest,
+    background_tasks: BackgroundTasks,
+    user_id: Optional[str] = Depends(verify_firebase_token),
+):
+    """Start a new research task or continue an existing session."""
+
+    # --- Clarifying questions for ambiguous queries ---
+    if not request.skip_clarification and not request.session_id:
+        questions = await detect_ambiguity(request.query)
+        if questions:
+            return ResearchResponse(
+                session_id="",
+                status="clarification_needed",
+                message="Your query may be ambiguous. Please clarify before we begin research.",
+                clarifying_questions=questions,
+            )
+
+    # --- Output mode resolution (backward-compatible) ---
+    output_mode = request.output_mode or request.mode or "deep"
+    allowed_output = {"quick", "deep", "technical"}
+    if output_mode not in allowed_output:
+        print(f"⚠️ Invalid output_mode '{output_mode}' received; defaulting to 'deep'")
+        output_mode = "deep"
+    # Map output_mode → internal pipeline mode (technical uses deep pipeline)
+    mode = "quick" if output_mode == "quick" else "deep"
+    audience = request.audience or "myself"
+    expertise_level = request.expertise_level or "intermediate"
+    print(f"Selected output_mode={output_mode}, internal mode={mode}, audience={audience}, expertise={expertise_level}")
+
+    now_ts = datetime.now().isoformat()
+    message_entry = {"role": "user", "content": request.query, "timestamp": now_ts}
+
+    # --- Session resolution: reuse existing or create new ---
+    session_id: str
+    if request.session_id:
+        session_id = request.session_id
+        if _firestore_db is not None:
+            existing = await _run_in_executor(store.get_session, request.session_id)
+            if existing:
+                await _run_in_executor(
+                    store.update_session_field,
+                    session_id,
+                    status="running",
+                )
+            else:
+                try:
+                    await _run_in_executor(
+                        store.create_session_with_id, session_id, user_id, request.query, mode,
+                    )
+                except Exception as e:
+                    print(f"Session creation with custom ID failed: {e}")
+    else:
+        if _firestore_db is not None:
+            session_id = await _run_in_executor(store.create_session, user_id, request.query, mode)
+        else:
+            session_id = str(uuid.uuid4())
+
+    # 1. Create/extend in-memory state
+    active_sessions[session_id] = {
+        "status": "pending",
+        "query": request.query,
+        "created_at": now_ts,
+        "logs": [],
+        "messages": [message_entry],
+        "mode": mode,
+        "output_mode": output_mode,
+        "audience": audience,
+        "expertise_level": expertise_level,
+        "comparison_mode": request.comparison_mode or False,
+        "subject_a": request.subject_a or "",
+        "subject_b": request.subject_b or "",
+    }
+
+    # 2. Start Background Task
+    background_tasks.add_task(
+        run_research_task_wrapper,
+        session_id,
+        request.query,
+        request.max_iterations,
+        request.search_provider,
+        mode,
+        user_id,
+        output_mode,
+        audience,
+        expertise_level,
+    )
+
+    return ResearchResponse(
+        session_id=session_id,
+        status="started",
+        message="Research task started in background",
+    )
+
+
+@app.get("/api/research/{session_id}")
+async def get_research_status(session_id: str):
+    """Get status and results (Hybrid: in-memory → Firestore)."""
+
+    # 1. Check active in-memory sessions (live)
+    if session_id in active_sessions:
+        return active_sessions[session_id]
+
+    # 2. Check Firestore (history)
+    try:
+        session = await _run_in_executor(store.get_session, session_id)
+        if session:
+            result_data = await _run_in_executor(store.get_results, session_id)
+            return {
+                "status": session.get("status", "unknown"),
+                "query": session.get("query", ""),
+                "created_at": session.get("created_at"),
+                "logs": [],
+                "result": {
+                    "report": result_data.get("report", "") if result_data else None,
+                    "sources": (result_data.get("evidence_summary", {}) or {}).get("sources", []) if result_data else [],
+                    "metadata": result_data.get("task_graph_summary", {}) if result_data else {},
+                } if result_data else None,
+            }
+    except Exception as e:
+        print(f"Firestore Fetch Error: {e}")
+
+    raise HTTPException(status_code=404, detail="Session not found")
+
+
+@app.get("/api/history")
+async def get_history(user_id: Optional[str] = Depends(verify_firebase_token)):
+    """List past research sessions from Firestore."""
+    try:
+        history = await _run_in_executor(store.get_research_history, user_id, 20)
+        return history
+    except Exception as e:
+        print(f"History Fetch Error: {e}")
+        return []
+
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint for deployment monitoring.
+
+    Probes **both** Firestore and Qdrant in parallel.  Returns a
+    structured response so that load-balancers can act on individual
+    component health.
+
+    Status values:
+        healthy   – all components reachable
+        degraded  – at least one component unavailable
+    """
+    # --- Firestore probe (via centralized executor) ---
+    async def _check_firestore() -> bool:
+        try:
+            from src.core.firebase_client import db as _db
+            if _db is None:
+                return False
+            await run_in_firestore_executor(
+                lambda: _db.collection("research_sessions").limit(1).get()
+            )
+            return True
+        except Exception:
+            return False
+
+    # --- Qdrant probe (via centralized executor) ---
+    async def _check_qdrant() -> bool:
+        try:
+            from src.memory.qdrant_store import QdrantClient as _QdrantClient
+            import os as _os
+
+            if _QdrantClient is None:
+                return False
+            url = _os.getenv("QDRANT_URL")
+            api_key = _os.getenv("QDRANT_API_KEY")
+            if url:
+                client = _QdrantClient(url=url, api_key=api_key, timeout=5)
+            else:
+                client = _QdrantClient(host="localhost", port=6333, timeout=5)
+            # get_collections is the lightest RPC that proves connectivity
+            await run_in_firestore_executor(client.get_collections)
+            return True
+        except Exception:
+            return False
+
+    # Apply 3-second timeout to each probe so health check doesn't hang
+    async def _with_timeout(coro, default=False):
+        try:
+            return await asyncio.wait_for(coro, timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            return default
+
+    firestore_ok, qdrant_ok = await asyncio.gather(
+        _with_timeout(_check_firestore()), _with_timeout(_check_qdrant())
+    )
+
+    overall = "healthy" if (firestore_ok and qdrant_ok) else "degraded"
+
+    return {
+        "status": overall,
+        "service": "deep-research-agent",
+        "timestamp": datetime.now().isoformat(),
+        "components": {
+            "firestore": "ok" if firestore_ok else "unreachable",
+            "qdrant": "ok" if qdrant_ok else "unreachable",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Part 4: Claim Challenge Mode endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/api/research/{session_id}/challenge")
+async def challenge_claim(session_id: str, request: ChallengeRequest):
+    """
+    Challenge a specific claim — runs adversarial verification
+    and returns corroborated / refuted / disputed verdict.
+    """
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    try:
+        from src.agents.claim_challenger import ClaimChallenger
+        from src.core.llm_client import LLMClient
+
+        llm = LLMClient()
+        challenger = ClaimChallenger(llm_client=llm, search_provider="tavily")
+        result = await challenger.challenge_claim(
+            claim_text=request.claim_text,
+            claim_marker=request.claim_marker,
+            original_domains=request.original_domains,
+            confidence_before=request.confidence_before,
+            timeout_seconds=30.0,
+        )
+        return result
+    except Exception as e:
+        logger.error("Challenge failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Part 4: Export Pipeline endpoint
+# ---------------------------------------------------------------------------
+
+@app.post("/api/research/{session_id}/export")
+async def export_research(session_id: str, request: ExportRequest):
+    """
+    Export a completed research session in the requested format.
+    Returns the file as a download.
+    """
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result_data = session.get("result")
+    if not result_data:
+        raise HTTPException(status_code=400, detail="Research not yet completed")
+
+    try:
+        from src.export.exporter import ResearchExporter
+        from src.core.llm_client import LLMClient
+
+        llm = LLMClient()
+        exporter = ResearchExporter(llm_client=llm)
+
+        buf = await exporter.export(
+            fmt=request.format,
+            report=result_data.get("report", ""),
+            sources=result_data.get("sources", []),
+            query=session.get("query", ""),
+            trust_metrics=result_data.get("trust_metrics"),
+            claims=result_data.get("claims"),
+        )
+
+        content_types = {
+            "pdf": "application/pdf",
+            "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "markdown": "text/markdown",
+            "checklist": "text/markdown",
+        }
+        extensions = {
+            "pdf": "pdf",
+            "pptx": "pptx",
+            "docx": "docx",
+            "markdown": "md",
+            "checklist": "md",
+        }
+
+        ct = content_types.get(request.format, "application/octet-stream")
+        ext = extensions.get(request.format, "bin")
+        filename = f"research-{session_id[:8]}.{ext}"
+
+        from fastapi.responses import Response
+        buf_bytes = buf.read()
+        return Response(
+            content=buf_bytes,
+            media_type=ct,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except Exception as e:
+        logger.error("Export failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Part 4: Visual Evidence Graph endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/research/{session_id}/graph")
+async def get_evidence_graph(session_id: str):
+    """
+    Return D3-compatible evidence graph data { nodes, edges }
+    for the visual evidence graph frontend.
+    """
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result_data = session.get("result")
+    if not result_data:
+        raise HTTPException(status_code=400, detail="Research not yet completed")
+
+    # evidence_graph_raw is stored at both top-level and inside metadata
+    evidence_graph_raw = result_data.get("evidence_graph_raw") or (result_data.get("metadata") or {}).get("evidence_graph", {})
+    if not evidence_graph_raw:
+        # Fallback: build minimal graph from claims/sources
+        return {"nodes": [], "edges": []}
+
+    try:
+        from src.evidence.graph import EvidenceGraph
+        eg = EvidenceGraph.from_dict(evidence_graph_raw)
+        return eg.to_graph_json()
+    except Exception as e:
+        logger.warning("Graph serialization failed, building from raw: %s", e)
+        # Manual fallback from raw dict
+        nodes = []
+        edges = []
+        for cid, claim in evidence_graph_raw.get("claims", {}).items():
+            text = claim.get("text", "")
+            nodes.append({
+                "id": cid,
+                "type": "claim",
+                "label": text[:80],
+                "confidence": claim.get("confidence", 0.5),
+            })
+        for sid, source in evidence_graph_raw.get("sources", {}).items():
+            nodes.append({
+                "id": sid,
+                "type": "source",
+                "label": source.get("title", source.get("domain", ""))[:60],
+                "reliability": source.get("reliability_score", 0.5),
+                "domain": source.get("domain", ""),
+            })
+        edges_raw = evidence_graph_raw.get("edges", {})
+        edge_list = list(edges_raw.values()) if isinstance(edges_raw, dict) else edges_raw
+        for edge in edge_list:
+            edges.append({
+                "source": edge.get("from_claim_id", edge.get("claim_id", "")),
+                "target": edge.get("to_source_id", edge.get("source_id", "")),
+                "relation": edge.get("relation", "mentions"),
+                "strength": edge.get("strength", 0.5),
+            })
+        return {"nodes": nodes, "edges": edges}
+
+
+# ---------------------------------------------------------------------------
+# Part 4: Source Genome (citation chain) endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/api/research/{session_id}/source-genome/{source_index}")
+async def get_source_genome(session_id: str, source_index: int):
+    """
+    Return citation chain / genome data for a specific source.
+    """
+    session = active_sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    result_data = session.get("result")
+    if not result_data:
+        raise HTTPException(status_code=400, detail="Research not yet completed")
+
+    sources = result_data.get("sources", [])
+    if source_index < 0 or source_index >= len(sources):
+        raise HTTPException(status_code=404, detail="Source index out of range")
+
+    source = sources[source_index]
+    url = source.get("url", "")
+
+    from urllib.parse import urlparse
+    domain = ""
+    try:
+        domain = urlparse(url).netloc.replace("www.", "")
+    except Exception:
+        pass
+
+    citation_chain = source.get("citation_chain", None)
+    if not citation_chain:
+        # Build citation chain from evidence graph if available
+        citation_chain = []
+        evidence_graph = result_data.get("metadata", {}).get("evidence_graph", {})
+        edges_raw = evidence_graph.get("edges", {})
+        edge_list = list(edges_raw.values()) if isinstance(edges_raw, dict) else (edges_raw if isinstance(edges_raw, list) else [])
+        claims_map = evidence_graph.get("claims", {})
+        sources_map = evidence_graph.get("sources", {})
+
+        # Find edges that reference this source
+        hop = 1
+        for edge in edge_list:
+            src_id = edge.get("to_source_id", edge.get("source_id", ""))
+            claim_id = edge.get("from_claim_id", edge.get("claim_id", ""))
+            # Match by domain or url in sources map
+            src_obj = sources_map.get(src_id, {})
+            src_url = src_obj.get("url", "")
+            if src_url == url or src_obj.get("domain", "") == domain:
+                claim_obj = claims_map.get(claim_id, {})
+                citation_chain.append({
+                    "hop": hop,
+                    "url": url,
+                    "domain": domain,
+                    "domain_trust": src_obj.get("reliability_score", source.get("reliability", 0.5)),
+                    "claim_text_at_this_hop": claim_obj.get("text", (source.get("content") or "")[:200]),
+                    "source_type": source.get("agent", "web_search"),
+                    "fetch_method": source.get("search_provider", "tavily"),
+                })
+                hop += 1
+
+        # Fallback: at least return the source itself as hop 1
+        if not citation_chain:
+            citation_chain.append({
+                "hop": 1,
+                "url": url,
+                "domain": domain,
+                "domain_trust": source.get("reliability", 0.5),
+                "claim_text_at_this_hop": (source.get("content") or "")[:200],
+                "source_type": source.get("agent", "web_search"),
+                "fetch_method": source.get("search_provider", "tavily"),
+            })
+
+    return {
+        "source_url": url,
+        "source_domain": domain,
+        "citation_chain": citation_chain,
+        "distortion_detected": False,
+        "distortion_summary": "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Architecture Generation endpoints
+# ---------------------------------------------------------------------------
+
+class ArchitectureRequest(BaseModel):
+    system_name: str = "Research System"
+    system_description: str = ""
+    recommended_solution: str = ""
+    constraints: Optional[Dict[str, Any]] = None
+    tradeoffs: Optional[List[str]] = None
+    confidence_score: float = 0.85
+
+
+class RunbookRequest(BaseModel):
+    architecture: Dict[str, Any]
+    target_cloud: str = "AWS"
+
+
+def _transform_architecture_for_frontend(
+    plan: Dict[str, Any], request: "ArchitectureRequest"
+) -> Dict[str, Any]:
+    """Transform backend architecture plan to match the frontend ArchitecturePlan interface."""
+    constraints = request.constraints or {}
+
+    # metadata: {system_name, dau, compliance_requirements, confidence_score}
+    raw_meta = plan.get("metadata", {})
+    plan["metadata"] = {
+        "system_name": raw_meta.get("generated_for", request.system_name),
+        "dau": constraints.get("daily_active_users", 0),
+        "compliance_requirements": constraints.get("compliance_requirements", []),
+        "confidence_score": raw_meta.get("confidence", request.confidence_score),
+    }
+
+    # components: [{name, purpose, technology, sla}] from component_breakdown
+    if "component_breakdown" in plan and "components" not in plan:
+        plan["components"] = [
+            {
+                "name": c.get("name", ""),
+                "purpose": c.get("purpose", ""),
+                "technology": c.get("technology", ""),
+                "sla": c.get("sla", {"availability": "99.9%", "latency_p99": "<500ms"}),
+            }
+            for c in plan.pop("component_breakdown")
+        ]
+
+    # technology_stack: [{component, technology, reasoning, pros, cons, cost_monthly_usd}]
+    raw_stack = plan.get("technology_stack", {})
+    if isinstance(raw_stack, dict):
+        transformed = []
+        for layer, techs in raw_stack.items():
+            if isinstance(techs, list):
+                for t in techs:
+                    if isinstance(t, str):
+                        transformed.append({"component": layer, "technology": t, "reasoning": "", "pros": [], "cons": [], "cost_monthly_usd": 0})
+                    elif isinstance(t, dict):
+                        transformed.append({"component": t.get("component", layer), "technology": t.get("technology", str(t)), "reasoning": t.get("reasoning", ""), "pros": t.get("pros", []), "cons": t.get("cons", []), "cost_monthly_usd": t.get("cost_monthly_usd", 0)})
+            elif isinstance(techs, str):
+                transformed.append({"component": layer, "technology": techs, "reasoning": "", "pros": [], "cons": [], "cost_monthly_usd": 0})
+        plan["technology_stack"] = transformed
+
+    # system_diagram: {format, diagram}
+    raw_diagram = plan.get("system_diagram", "")
+    if isinstance(raw_diagram, str):
+        plan["system_diagram"] = {"format": "mermaid", "diagram": raw_diagram}
+
+    # cost_model: {total_monthly_cost: {total_usd, llm_cost_usd, infrastructure_cost_usd}}
+    raw_cost = plan.get("cost_model", {})
+    if "total_monthly_cost" not in raw_cost:
+        min_cost = raw_cost.get("estimated_monthly_min", 0)
+        max_cost = raw_cost.get("estimated_monthly_max", 0)
+        total = (min_cost + max_cost) / 2 if (min_cost or max_cost) else 0
+        plan["cost_model"] = {
+            "total_monthly_cost": {
+                "total_usd": total,
+                "llm_cost_usd": total * 0.3,
+                "infrastructure_cost_usd": total * 0.7,
+            }
+        }
+
+    # risk_mitigation: [{risk, probability, impact, mitigation: string[], rto}]
+    raw_risks = plan.get("risk_mitigation", [])
+    if raw_risks and isinstance(raw_risks[0], dict) and "severity" in raw_risks[0]:
+        plan["risk_mitigation"] = [
+            {
+                "risk": r.get("risk", ""),
+                "probability": r.get("severity", "medium"),
+                "impact": r.get("severity", "medium"),
+                "mitigation": [r["mitigation"]] if isinstance(r.get("mitigation"), str) else r.get("mitigation", []),
+                "rto": r.get("rto", "< 1 hour"),
+            }
+            for r in raw_risks
+        ]
+
+    return plan
+
+
+@app.post("/api/generate-architecture")
+async def generate_architecture(request: ArchitectureRequest):
+    """Generate a production architecture plan from research results."""
+    try:
+        from src.architecture_generator import ArchitectureGenerator
+        from src.core.llm_client import LLMClient
+
+        llm = LLMClient()
+        generator = ArchitectureGenerator(llm_client=llm)
+
+        plan = await generator.generate_architecture(
+            system_name=request.system_name,
+            system_description=request.system_description,
+            recommended_solution=request.recommended_solution,
+            constraints=request.constraints,
+            tradeoffs=request.tradeoffs,
+            confidence_score=request.confidence_score,
+        )
+        return _transform_architecture_for_frontend(plan, request)
+    except Exception as e:
+        logger.error("Architecture generation failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/generate-deployment-runbook")
+async def generate_deployment_runbook(request: RunbookRequest):
+    """Generate a cloud-specific deployment runbook."""
+    from fastapi.responses import PlainTextResponse
+
+    try:
+        from src.architecture_generator import ArchitectureGenerator
+        from src.core.llm_client import LLMClient
+
+        llm = LLMClient()
+        generator = ArchitectureGenerator(llm_client=llm)
+
+        runbook = await generator.generate_runbook(
+            architecture=request.architecture,
+            target_cloud=request.target_cloud,
+        )
+        return PlainTextResponse(runbook)
+    except Exception as e:
+        logger.error("Runbook generation failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    import os, uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
