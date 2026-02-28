@@ -249,3 +249,255 @@ class Mem0Client:
             f"{self.BASE_URL}/v1/memories/{memory_id}/",
             headers=self.headers,
             timeout=30,
+        )
+        
+        if response.status_code == 404:
+            return None
+        
+        response.raise_for_status()
+        return Memory.from_dict(response.json())
+    
+    def update_memory(
+        self,
+        memory_id: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """
+        Update an existing memory.
+        
+        Args:
+            memory_id: ID of memory to update
+            text: New memory text
+            
+        Returns:
+            Update response
+        """
+        payload = {"text": text}
+        
+        response = requests.put(
+            f"{self.BASE_URL}/v1/memories/{memory_id}/",
+            headers=self.headers,
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+    
+    def delete_memory(self, memory_id: str) -> bool:
+        """
+        Delete a memory.
+        
+        Args:
+            memory_id: ID of memory to delete
+            
+        Returns:
+            True if deleted successfully
+        """
+        response = requests.delete(
+            f"{self.BASE_URL}/v1/memories/{memory_id}/",
+            headers=self.headers,
+            timeout=30,
+        )
+        return response.status_code == 200
+    
+    def delete_all_memories(
+        self,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Delete all memories for a user or agent.
+        
+        Args:
+            user_id: Delete memories for this user
+            agent_id: Delete memories for this agent
+            
+        Returns:
+            True if deleted successfully
+        """
+        params = {}
+        if user_id:
+            params["user_id"] = user_id
+        if agent_id:
+            params["agent_id"] = agent_id
+        
+        response = requests.delete(
+            f"{self.BASE_URL}/v1/memories/",
+            headers=self.headers,
+            params=params,
+            timeout=30,
+        )
+        return response.status_code == 200
+
+
+class ResearchMemoryManager:
+    """
+    High-level memory manager for research workflows.
+    
+    Coordinates between Mem0 (semantic memory) and Firestore (structured data)
+    to provide a unified memory interface for the research agent.
+    """
+    
+    def __init__(
+        self,
+        mem0_client: Mem0Client,
+        firestore_storage: Optional[Any] = None,
+    ):
+        """
+        Initialize research memory manager.
+        
+        Args:
+            mem0_client: Mem0 client for semantic memory
+            firestore_storage: Firestore storage for structured data
+        """
+        self.mem0 = mem0_client
+        self.storage = firestore_storage
+        self.agent_id = "deep-research-agent"
+    
+    def store_research_findings(
+        self,
+        session_id: str,
+        query: str,
+        findings: List[Dict[str, Any]],
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Store research findings as memories.
+        
+        Args:
+            session_id: Research session ID
+            query: Original research query
+            findings: List of validated findings
+            user_id: User who initiated research
+            
+        Returns:
+            List of created memory IDs
+        """
+        memory_ids = []
+        
+        # Convert findings to conversation format for Mem0
+        messages = [
+            {"role": "user", "content": f"Research query: {query}"}
+        ]
+        
+        for finding in findings:
+            content = f"""
+Research finding from {finding.get('source', 'unknown source')}:
+{finding.get('content', finding.get('text', ''))}
+
+Key claims:
+{json.dumps(finding.get('claims', []), indent=2)}
+
+Reliability score: {finding.get('reliability_score', 'N/A')}
+"""
+            messages.append({"role": "assistant", "content": content})
+        
+        # Store via Mem0 with research-specific categories
+        result = self.mem0.add_memory(
+            messages=messages,
+            user_id=user_id,
+            agent_id=self.agent_id,
+            run_id=session_id,
+            metadata={
+                "session_id": session_id,
+                "query": query,
+                "finding_count": len(findings),
+                "type": "research_findings",
+            },
+            categories={
+                "research": "Research findings and claims",
+                "sources": "Information about sources",
+                "claims": "Factual claims extracted from research",
+            },
+        )
+        
+        for item in result:
+            if item.get("event") == "ADD" and item.get("id"):
+                memory_ids.append(item["id"])
+        
+        return memory_ids
+    
+    def recall_relevant_memories(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        top_k: int = 10,
+    ) -> List[Memory]:
+        """
+        Recall memories relevant to a new research query.
+        
+        Useful for:
+        - Avoiding redundant research
+        - Building on previous findings
+        - Identifying related claims
+        
+        Args:
+            query: New research query
+            user_id: User context
+            top_k: Number of memories to return
+            
+        Returns:
+            List of relevant memories
+        """
+        return self.mem0.search_memories(
+            query=query,
+            user_id=user_id,
+            agent_id=self.agent_id,
+            top_k=top_k,
+            threshold=0.6,  # Lower threshold for broad recall
+            rerank=True,
+        )
+    
+    def get_session_memories(self, session_id: str) -> List[Memory]:
+        """Get all memories from a specific research session."""
+        return self.mem0.get_memories(
+            run_id=session_id,
+            agent_id=self.agent_id,
+        )
+    
+    def store_claim(
+        self,
+        claim_text: str,
+        source_url: str,
+        confidence: float,
+        session_id: str,
+        user_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """
+        Store a specific claim as a memory.
+        
+        Args:
+            claim_text: The claim statement
+            source_url: URL of the source
+            confidence: Confidence score
+            session_id: Session ID
+            user_id: User ID
+            
+        Returns:
+            Memory ID if created
+        """
+        messages = [
+            {
+                "role": "assistant",
+                "content": f"Verified claim (confidence: {confidence:.2f}): {claim_text}\nSource: {source_url}"
+            }
+        ]
+        
+        result = self.mem0.add_memory(
+            messages=messages,
+            user_id=user_id,
+            agent_id=self.agent_id,
+            run_id=session_id,
+            metadata={
+                "type": "claim",
+                "source_url": source_url,
+                "confidence": confidence,
+            },
+            infer=False,  # Store exactly as provided
+        )
+        
+        for item in result:
+            if item.get("id"):
+                return item["id"]
+        
+        return None
