@@ -268,3 +268,273 @@ export function EvidenceGraph({ sessionId, isOpen, onClose }: EvidenceGraphProps
         )}
 
         {/* Content */}
+        <div className="flex-1 flex overflow-hidden">
+          {/* Graph Area */}
+          <div className="flex-1 relative overflow-auto">
+            {loading && (
+              <div className="absolute inset-0 flex items-center justify-center">
+                <div className="h-6 w-6 border-2 border-zinc-600 border-t-blue-500 rounded-full animate-spin" />
+              </div>
+            )}
+            {error && (
+              <div className="absolute inset-0 flex items-center justify-center text-red-400 text-sm">
+                {error}
+              </div>
+            )}
+            {!loading && !error && data && data.nodes.length === 0 && (
+              <div className="absolute inset-0 flex items-center justify-center text-zinc-500 text-sm">
+                No evidence graph data available.
+              </div>
+            )}
+            {!loading && !error && data && data.nodes.length > 0 && (
+              <svg
+                viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+                className="w-full h-full"
+                style={{ minHeight: svgHeight }}
+                onClick={() => setSelectedNode(null)}
+              >
+                {/* Column headers */}
+                <text x={svgWidth * 0.22} y={28} textAnchor="middle" className="fill-zinc-500 text-[11px] font-semibold" style={{ fontSize: 11 }}>
+                  CLAIMS
+                </text>
+                <text x={svgWidth * 0.78} y={28} textAnchor="middle" className="fill-zinc-500 text-[11px] font-semibold" style={{ fontSize: 11 }}>
+                  SOURCES
+                </text>
+
+                {/* Edges */}
+                <g>
+                  {filteredEdges.map((edge, i) => {
+                    const src = allLayoutNodes.get(edge.source);
+                    const tgt = allLayoutNodes.get(edge.target);
+                    if (!src || !tgt) return null;
+
+                    const edgeKey = `${edge.source}-${edge.target}-${i}`;
+                    const isActive = activeNodeId ? connectedEdges.has(edgeKey) : true;
+                    const opacity = activeNodeId ? (isActive ? 0.7 : 0.08) : 0.35;
+
+                    const strokeColor =
+                      edge.relation === "supports" ? "#22c55e" :
+                      edge.relation === "contradicts" ? "#ef4444" :
+                      "#52525b";
+
+                    const strokeWidth = isActive ? 2 : 1;
+
+                    // Curved path
+                    const midX = (src.x + tgt.x) / 2;
+                    const path = `M ${src.x} ${src.y} C ${midX} ${src.y}, ${midX} ${tgt.y}, ${tgt.x} ${tgt.y}`;
+
+                    return (
+                      <path
+                        key={edgeKey}
+                        d={path}
+                        fill="none"
+                        stroke={strokeColor}
+                        strokeWidth={strokeWidth}
+                        opacity={opacity}
+                        className="transition-all duration-200"
+                      />
+                    );
+                  })}
+                </g>
+
+                {/* Claim Nodes */}
+                {claimNodes.map(node => {
+                  const conf = node.data.confidence ?? 0.5;
+                  const isActive = !activeNodeId || connectedNodeIds.has(node.id);
+                  const isSelected = selectedNode === node.id;
+                  const nodeOpacity = isActive ? 1 : 0.2;
+
+                  return (
+                    <g
+                      key={node.id}
+                      transform={`translate(${node.x}, ${node.y})`}
+                      opacity={nodeOpacity}
+                      className="cursor-pointer transition-opacity duration-200"
+                      onClick={(e) => { e.stopPropagation(); setSelectedNode(node.id === selectedNode ? null : node.id); }}
+                      onMouseEnter={() => setHoveredNode(node.id)}
+                      onMouseLeave={() => setHoveredNode(null)}
+                    >
+                      {/* Selection ring */}
+                      {isSelected && <circle r={16} fill="none" stroke="#3b82f6" strokeWidth={2} opacity={0.5} className="animate-pulse" />}
+                      {/* Node circle */}
+                      <circle r={10} fill="#1e3a5f" stroke="#3b82f6" strokeWidth={1.5} />
+                      {/* Confidence indicator arc */}
+                      <circle
+                        r={10}
+                        fill="none"
+                        stroke={conf >= 0.7 ? "#22c55e" : conf >= 0.4 ? "#eab308" : "#ef4444"}
+                        strokeWidth={2.5}
+                        strokeDasharray={`${conf * 62.8} ${62.8}`}
+                        strokeDashoffset={0}
+                        transform="rotate(-90)"
+                        opacity={0.8}
+                      />
+                      {/* Label */}
+                      <text
+                        x={-18}
+                        y={0}
+                        textAnchor="end"
+                        dominantBaseline="middle"
+                        className="fill-zinc-300"
+                        style={{ fontSize: 10 }}
+                      >
+                        {truncate(node.data.label || node.id, 35)}
+                      </text>
+                    </g>
+                  );
+                })}
+
+                {/* Source Nodes */}
+                {sourceNodes.map(node => {
+                  const rel = node.data.reliability ?? 0.5;
+                  const isActive = !activeNodeId || connectedNodeIds.has(node.id);
+                  const isSelected = selectedNode === node.id;
+                  const nodeOpacity = isActive ? 1 : 0.2;
+
+                  return (
+                    <g
+                      key={node.id}
+                      transform={`translate(${node.x}, ${node.y})`}
+                      opacity={nodeOpacity}
+                      className="cursor-pointer transition-opacity duration-200"
+                      onClick={(e) => { e.stopPropagation(); setSelectedNode(node.id === selectedNode ? null : node.id); }}
+                      onMouseEnter={() => setHoveredNode(node.id)}
+                      onMouseLeave={() => setHoveredNode(null)}
+                    >
+                      {isSelected && <rect x={-9} y={-9} width={18} height={18} rx={4} fill="none" stroke="#22c55e" strokeWidth={2} opacity={0.5} className="animate-pulse" />}
+                      <rect x={-7} y={-7} width={14} height={14} rx={3} fill="#14532d" stroke="#22c55e" strokeWidth={1.5} />
+                      {/* Label */}
+                      <text
+                        x={18}
+                        y={0}
+                        textAnchor="start"
+                        dominantBaseline="middle"
+                        className="fill-zinc-300"
+                        style={{ fontSize: 10 }}
+                      >
+                        {truncate(node.data.label || node.data.domain || node.id, 35)}
+                      </text>
+                    </g>
+                  );
+                })}
+              </svg>
+            )}
+          </div>
+
+          {/* Detail Sidebar */}
+          {selectedDetail && (
+            <div className="w-72 border-l border-zinc-800 bg-zinc-900/50 overflow-y-auto shrink-0 animate-in slide-in-from-right-4 duration-200">
+              <div className="p-4 space-y-4">
+                {/* Node Header */}
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    {selectedDetail.isSource ? (
+                      <div className="h-6 w-6 rounded bg-emerald-950 border border-emerald-800 flex items-center justify-center">
+                        <Shield className="h-3.5 w-3.5 text-emerald-400" />
+                      </div>
+                    ) : (
+                      <div className="h-6 w-6 rounded-full bg-blue-950 border border-blue-800 flex items-center justify-center">
+                        <FileText className="h-3.5 w-3.5 text-blue-400" />
+                      </div>
+                    )}
+                    <span className="text-xs font-semibold text-zinc-200 uppercase tracking-wider">
+                      {selectedDetail.isSource ? "Source" : "Claim"}
+                    </span>
+                  </div>
+                  <p className="text-[12px] text-zinc-300 leading-relaxed">
+                    {selectedDetail.node.label || selectedDetail.node.id}
+                  </p>
+                </div>
+
+                {/* Metrics */}
+                <div className="space-y-2 border-t border-zinc-800 pt-3">
+                  {!selectedDetail.isSource && (
+                    <div>
+                      <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Confidence</span>
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className={cn("text-lg font-bold", confidenceColor(selectedDetail.node.confidence ?? 0.5))}>
+                          {((selectedDetail.node.confidence ?? 0.5) * 100).toFixed(0)}%
+                        </span>
+                        <div className={cn("h-2 w-2 rounded-full", confidenceBg(selectedDetail.node.confidence ?? 0.5))} />
+                      </div>
+                    </div>
+                  )}
+                  {selectedDetail.isSource && (
+                    <div>
+                      <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Reliability</span>
+                      <div className="mt-1">
+                        {reliabilityBar(selectedDetail.node.reliability ?? 0.5)}
+                      </div>
+                      {selectedDetail.node.domain && (
+                        <p className="text-[10px] text-zinc-500 mt-1 font-mono">{selectedDetail.node.domain}</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Edge Summary */}
+                <div className="space-y-1.5 border-t border-zinc-800 pt-3">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider">Connections</span>
+                  <div className="flex items-center gap-3 mt-1">
+                    {selectedDetail.edgeStats.supports > 0 && (
+                      <div className="flex items-center gap-1">
+                        <CheckCircle2 className="h-3 w-3 text-emerald-400" />
+                        <span className="text-[11px] text-emerald-400 font-medium">{selectedDetail.edgeStats.supports}</span>
+                      </div>
+                    )}
+                    {selectedDetail.edgeStats.contradicts > 0 && (
+                      <div className="flex items-center gap-1">
+                        <AlertTriangle className="h-3 w-3 text-red-400" />
+                        <span className="text-[11px] text-red-400 font-medium">{selectedDetail.edgeStats.contradicts}</span>
+                      </div>
+                    )}
+                    {selectedDetail.edgeStats.mentions > 0 && (
+                      <div className="flex items-center gap-1">
+                        <Link2 className="h-3 w-3 text-zinc-400" />
+                        <span className="text-[11px] text-zinc-400 font-medium">{selectedDetail.edgeStats.mentions}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Connected nodes list */}
+                <div className="space-y-1.5 border-t border-zinc-800 pt-3">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-wider">
+                    {selectedDetail.isSource ? "Linked Claims" : "Linked Sources"}
+                  </span>
+                  <div className="space-y-1 mt-1">
+                    {selectedDetail.connected.map((conn, i) => (
+                      <button
+                        key={i}
+                        onClick={() => conn.node && setSelectedNode(conn.node.id)}
+                        className="w-full text-left px-2 py-1.5 rounded-md hover:bg-zinc-800/60 transition-colors group"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className={cn(
+                            "h-1.5 w-1.5 rounded-full shrink-0",
+                            conn.relation === "supports" ? "bg-emerald-500" :
+                            conn.relation === "contradicts" ? "bg-red-500" : "bg-zinc-600"
+                          )} />
+                          <span className="text-[11px] text-zinc-400 group-hover:text-zinc-200 truncate">
+                            {conn.node?.label || "Unknown"}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2 mt-0.5 ml-3.5">
+                          <span className="text-[9px] text-zinc-600 capitalize">{conn.relation}</span>
+                          <span className="text-[9px] text-zinc-600">· str: {((conn.strength ?? 0.5) * 100).toFixed(0)}%</span>
+                        </div>
+                      </button>
+                    ))}
+                    {selectedDetail.connected.length === 0 && (
+                      <p className="text-[10px] text-zinc-600 italic">No connections</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
