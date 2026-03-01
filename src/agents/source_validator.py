@@ -176,3 +176,182 @@ Evaluate and respond with JSON:
 
         # Extract basic key_claims from title and content so the evidence
         # graph always has claim-source edges even when LLM parsing fails.
+        key_claims = []
+        title = finding.get("title", "").strip()
+        if title:
+            key_claims.append(title)
+        content = finding.get("content", finding.get("text", "")).strip()
+        if content:
+            sentences = [s.strip() for s in content.split(".") if len(s.strip()) > 30]
+            for sent in sentences[:3]:
+                key_claims.append(sent + ".")
+
+        return {
+            "reliability_score": score,
+            "source_credibility": credibility,
+            "content_veracity": "uncertain",
+            "key_claims": key_claims,
+            "supported_claims": [],
+            "unsupported_claims": [],
+            "potential_issues": ["heuristic_only"],
+            "validation_notes": "Scored using heuristic fallback",
+            "recommendation": "verify" if score < 0.7 else "accept",
+        }
+    
+    def validate_batch(
+        self,
+        findings: List[Dict[str, Any]],
+        use_llm: bool = False,  # Default to heuristics for speed
+        max_llm_validations: int = 8,  # Cap LLM calls to prevent slowness
+    ) -> List[Dict[str, Any]]:
+        """
+        Validate a batch of findings.
+        
+        Args:
+            findings: List of findings to validate
+            use_llm: If True, use LLM for validation (slower but more accurate)
+            max_llm_validations: Max number of findings to validate with LLM
+            
+        Returns:
+            List of validated findings with scores
+        """
+        validated = []
+        llm_count = 0
+        for finding in findings:
+            # Use LLM validation for first N findings, heuristics for the rest
+            if use_llm and llm_count < max_llm_validations:
+                validation = self.validate_finding(finding)
+                llm_count += 1
+            else:
+                validation = self._heuristic_validation(finding)
+            
+            # Merge validation into finding
+            validated_finding = {**finding}
+            validated_finding["reliability_score"] = validation.get("reliability_score", 0.5)
+            validated_finding["validation"] = validation
+            validated.append(validated_finding)
+            
+            # Update context if available
+            if self.context and self.context.current_session_id:
+                session = self.context.get_session()
+                # Find and update the finding in context
+                for i, f in enumerate(session.findings):
+                    if f.get("source") == finding.get("source"):
+                        self.context.mark_source_validated(
+                            finding_index=i,
+                            reliability_score=validation.get("reliability_score", 0.5),
+                            validation_notes=validation.get("validation_notes", ""),
+                        )
+                        break
+        
+        return validated
+    
+    def cross_validate(
+        self,
+        findings: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Cross-validate findings against each other for consistency.
+        
+        Args:
+            findings: Validated findings to cross-check
+            
+        Returns:
+            Cross-validation summary
+        """
+        if len(findings) < 2:
+            return {"consistent": True, "conflicts": []}
+        
+        # Extract key claims from all findings
+        all_claims = []
+        for f in findings:
+            if "validation" in f:
+                all_claims.extend(f["validation"].get("key_claims", []))
+        
+        cross_check_prompt = f"""Analyze these key claims from different sources for consistency:
+
+CLAIMS:
+{json.dumps(all_claims[:20], indent=2)}
+
+Identify any contradictions or significant disagreements between sources.
+Respond with JSON:
+{{
+    "consistent": true/false,
+    "conflicts": [
+        {{"claim_a": "...", "claim_b": "...", "conflict_type": "contradiction|disagreement|uncertain"}}
+    ],
+    "consensus_claims": ["claims all sources agree on"],
+    "summary": "Brief consistency assessment"
+}}
+"""
+        
+        response = self.llm.chat(
+            messages=[{"role": "user", "content": cross_check_prompt}],
+            model="fast",
+            system_prompt=self.system_prompt,
+            temperature=0.2,
+        )
+        
+        try:
+            content = response.content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+            return json.loads(content.strip())
+        except:
+            return {"consistent": True, "conflicts": [], "summary": "Unable to cross-validate"}
+    
+    def execute(self, input_data: Dict[str, Any]) -> AgentResult:
+        """
+        Execute the source validation agent.
+        
+        Args:
+            input_data: Must contain 'findings' key with list of findings
+            
+        Returns:
+            AgentResult with validated findings
+        """
+        findings = input_data.get("findings", [])
+        if not findings:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name=self.name,
+                error="No findings provided for validation",
+            )
+        
+        try:
+            # Use LLM-based validation in deep mode for real verification
+            mode = input_data.get("mode", "deep")
+            use_llm = mode != "quick"
+            self.log(f"Validating {len(findings)} findings (llm={use_llm}, mode={mode})")
+            validated = self.validate_batch(findings, use_llm=use_llm)
+            
+            # Skip cross-validation for speed (can be enabled later)
+            cross_validation = {"consistent": True, "conflicts": [], "summary": "Skipped for performance"}
+            
+            # Calculate summary stats
+            scores = [f.get("reliability_score", 0) for f in validated]
+            avg_score = sum(scores) / len(scores) if scores else 0
+            accepted = len([s for s in scores if s >= 0.7])
+            
+            return AgentResult(
+                success=True,
+                content=validated,
+                agent_name=self.name,
+                metadata={
+                    "num_validated": len(validated),
+                    "avg_reliability": round(avg_score, 2),
+                    "accepted_count": accepted,
+                    "cross_validation": cross_validation,
+                },
+            )
+        
+        except Exception as e:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name=self.name,
+                error=str(e),
+            )
