@@ -193,3 +193,198 @@ JSON claims:"""
         sources: List[Dict[str, Any]],
         max_claims_per_source: int = 5,
     ) -> List[Dict[str, Any]]:
+        """
+        Extract claims from multiple sources.
+        
+        Args:
+            sources: List of source dictionaries with 'content' key
+            max_claims_per_source: Max claims per source
+            
+        Returns:
+            List of all extracted claims with source references
+        """
+        all_claims = []
+        
+        for source in sources:
+            content = source.get("content", source.get("text", ""))
+            source_url = source.get("url", source.get("source", ""))
+            source_id = source.get("id", source.get("source_id", ""))
+            
+            if not content:
+                continue
+            
+            claims = self.extract_claims(
+                content=content,
+                source_url=source_url,
+                max_claims=max_claims_per_source,
+            )
+            
+            # Add source reference to each claim
+            for claim in claims:
+                claim["source_id"] = source_id
+                claim["source_url"] = source_url
+                claim["normalized_text"] = self.normalize_claim(claim["claim"])
+            
+            all_claims.extend(claims)
+        
+        return all_claims
+    
+    def create_claim_objects(
+        self,
+        claim_dicts: List[Dict[str, Any]],
+    ) -> List[Claim]:
+        """
+        Convert claim dictionaries to Claim objects.
+        
+        Args:
+            claim_dicts: List of claim dictionaries
+            
+        Returns:
+            List of Claim objects
+        """
+        claims = []
+        
+        for c in claim_dicts:
+            claim = Claim(
+                text=c.get("claim", ""),
+                normalized_text=c.get("normalized_text", self.normalize_claim(c.get("claim", ""))),
+                confidence=c.get("confidence", 0.5),
+                supporting_text=c.get("supporting_text", ""),
+                provenance=[c.get("source_id", "")] if c.get("source_id") else [],
+            )
+            claims.append(claim)
+        
+        return claims
+    
+    async def extract_and_store(
+        self,
+        sources: List[Dict[str, Any]],
+        session_id: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Extract claims and store them via MemoryAPI.
+        
+        Args:
+            sources: List of source dictionaries
+            session_id: Optional session ID
+            
+        Returns:
+            List of stored claim IDs
+        """
+        if not self.memory_api:
+            self.log("No MemoryAPI available, returning claims without storage")
+            claims = self.extract_claims_batch(sources)
+            return [c.get("claim", "") for c in claims]
+        
+        claim_ids = []
+        
+        for source in sources:
+            content = source.get("content", source.get("text", ""))
+            source_id = source.get("id", source.get("source_id", ""))
+            
+            if not content or not source_id:
+                continue
+            
+            # Extract claims
+            claims = self.extract_claims(content=content, source_url=source.get("url", ""))
+            
+            # Store each claim
+            for claim_dict in claims:
+                claim = Claim(
+                    text=claim_dict["claim"],
+                    normalized_text=self.normalize_claim(claim_dict["claim"]),
+                    confidence=claim_dict["confidence"],
+                    supporting_text=claim_dict["supporting_text"],
+                )
+                
+                # Determine relation based on confidence
+                relation = EvidenceRelation.SUPPORTS if claim_dict["confidence"] > 0.6 else EvidenceRelation.MENTIONS
+                
+                claim_id = await self.memory_api.add_claim(
+                    claim=claim,
+                    source_id=source_id,
+                    relation=relation,
+                    strength=claim_dict["confidence"],
+                )
+                claim_ids.append(claim_id)
+        
+        return claim_ids
+    
+    def execute(self, input_data: Dict[str, Any]) -> AgentResult:
+        """
+        Execute the claim extractor.
+        
+        Args:
+            input_data: Must contain 'sources' (list) or 'content' (string)
+            
+        Returns:
+            AgentResult with extracted claims
+        """
+        sources = input_data.get("sources", [])
+        content = input_data.get("content", "")
+        source_url = input_data.get("source_url", input_data.get("url", ""))
+        mode = input_data.get("mode", "quick")
+        # Scale max_claims by mode: deep/technical get more claims
+        default_max = 30 if mode in ("deep", "technical") else 10
+        max_claims = input_data.get("max_claims", default_max)
+        
+        try:
+            if sources:
+                # Cap sources to avoid diluting claims across too many
+                MAX_SOURCES = 20
+                if len(sources) > MAX_SOURCES:
+                    # Prefer sources with content, sorted by reliability
+                    scored = sorted(
+                        sources,
+                        key=lambda s: float(s.get("reliability_score", s.get("score", 0.5))),
+                        reverse=True,
+                    )
+                    sources = scored[:MAX_SOURCES]
+                
+                # Ensure at least 2 claims per source (never 0)
+                max_claims_per_source = max(2, max_claims // max(1, len(sources)))
+                
+                # Batch extraction
+                claims = self.extract_claims_batch(
+                    sources=sources,
+                    max_claims_per_source=max_claims_per_source,
+                )
+            elif content:
+                # Single content extraction
+                claims = self.extract_claims(
+                    content=content,
+                    source_url=source_url,
+                    max_claims=max_claims,
+                )
+            else:
+                return AgentResult(
+                    success=False,
+                    content=None,
+                    agent_name="ClaimExtractorAgent",
+                    error="Either 'sources' or 'content' is required",
+                )
+            
+            # Create Claim objects
+            claim_objects = self.create_claim_objects(claims)
+            
+            return AgentResult(
+                success=True,
+                content={
+                    "claims": claims,
+                    "claim_objects": [c.to_dict() for c in claim_objects],
+                    "count": len(claims),
+                },
+                agent_name="ClaimExtractorAgent",
+                metadata={
+                    "source_count": len(sources) if sources else 1,
+                    "claims_extracted": len(claims),
+                },
+            )
+            
+        except Exception as e:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name="ClaimExtractorAgent",
+                error=str(e),
+            )
