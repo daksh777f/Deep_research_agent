@@ -265,3 +265,270 @@ class TaskExecutor:
     ) -> Any:
         """
         Execute a node asynchronously with per-task timeout.
+        
+        Args:
+            node: Task node
+            task_graph: Parent task graph
+            context: Execution context
+            
+        Returns:
+            Task result
+        """
+        # Mark as running
+        task_graph.mark_running(node.id)
+        
+        timeout = self.TASK_TIMEOUTS.get(node.type, 60)
+        
+        try:
+            # Run in thread pool to avoid blocking, with timeout
+            loop = asyncio.get_event_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self.executor,
+                    self._execute_node_sync,
+                    node,
+                    context,
+                ),
+                timeout=timeout,
+            )
+            
+            # Mark complete
+            task_graph.mark_complete(node.id, result)
+            
+            # Update context with results
+            self._update_context(node, result, context)
+            
+            return result
+
+        except asyncio.TimeoutError:
+            print(f"⚠️ Task {node.id} ({node.type.value}) timed out after {timeout}s")
+            task_graph.mark_failed(node.id, f"Timeout after {timeout}s")
+            return None
+            
+        except Exception as e:
+            # Mark failed
+            task_graph.mark_failed(node.id, str(e))
+            raise
+    
+    async def execute_nodes_parallel(
+        self,
+        nodes: List[TaskNode],
+        task_graph: TaskGraph,
+        context: Dict[str, Any],
+    ) -> List[Any]:
+        """
+        Execute multiple nodes in parallel.
+        
+        Args:
+            nodes: List of ready nodes
+            task_graph: Parent task graph
+            context: Execution context
+            
+        Returns:
+            List of results
+        """
+        tasks = [
+            self.execute_node(node, task_graph, context)
+            for node in nodes
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Handle exceptions
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"Task {nodes[i].id} failed: {result}")
+        
+        return results
+    
+    async def execute_graph(
+        self,
+        task_graph: TaskGraph,
+        initial_context: Optional[Dict[str, Any]] = None,
+        on_progress: Optional[callable] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute a complete task graph.
+        
+        Iteratively executes ready nodes until all complete
+        or a stopping condition is met.
+        
+        Args:
+            task_graph: Task graph to execute
+            initial_context: Optional initial context
+            
+        Returns:
+            Final execution context with all results
+        """
+        context = initial_context or {
+            "results": {},
+            "sources": [],
+            "findings": [],
+            "validated_findings": [],
+            "claims": [],
+        }
+        
+        # Initialize phase tracking
+        if "phases" not in context:
+            context["phases"] = init_phases()
+
+        max_iterations = 100  # Safety limit
+        iteration = 0
+        
+        while iteration < max_iterations:
+            iteration += 1
+            
+            # Check stopping conditions
+            should_stop, reason = task_graph.should_stop()
+            if should_stop:
+                context["stop_reason"] = reason
+                break
+            
+            # Get ready nodes
+            ready = task_graph.get_ready_nodes()
+            
+            if not ready:
+                # All done or blocked
+                break
+            
+            # Execute ready nodes in parallel
+            await self.execute_nodes_parallel(ready, task_graph, context)
+            
+            # Sync phase statuses from task graph
+            _sync_phases_from_graph(context["phases"], task_graph)
+            if on_progress:
+                on_progress(context)
+            
+            # Check for reflexion result that may require replanning
+            for node in ready:
+                if node.type == TaskType.REFLEXION and node.status == TaskStatus.COMPLETE:
+                    context["reflexion_result"] = node.result
+        
+        # Final stats
+        context["execution_stats"] = {
+            "iterations": iteration,
+            "total_nodes": len(task_graph.nodes),
+            "completed": len(task_graph.get_completed_nodes()),
+            "failed": len(task_graph.get_failed_nodes()),
+            "total_time_ms": task_graph.metrics["total_time_ms"],
+        }
+        
+        return context
+    
+    def _update_context(
+        self,
+        node: TaskNode,
+        result: Any,
+        context: Dict[str, Any],
+    ) -> None:
+        """
+        Update execution context with task result.
+        
+        Args:
+            node: Completed task node
+            result: Task result
+            context: Context to update
+        """
+        # Store result by node ID
+        if "results" not in context:
+            context["results"] = {}
+        context["results"][node.id] = result
+        
+        # Extract and aggregate based on task type
+        if result is None:
+            return
+        
+        content = result.content if hasattr(result, "content") else result
+        
+        if node.type in [TaskType.SEARCH_WEB, TaskType.SEARCH_ACADEMIC, TaskType.SEARCH_TECHNICAL]:
+            # Store search results as findings
+            if isinstance(content, dict):
+                findings = content.get("findings", content.get("results", []))
+            elif isinstance(content, list):
+                findings = content
+            else:
+                findings = []
+            
+            context.setdefault("sources", []).extend(findings)
+            context.setdefault("findings", []).extend(findings)
+        
+        elif node.type == TaskType.VALIDATE_CLAIMS:
+            # Store validated findings
+            if isinstance(content, dict):
+                validated = content.get("validated_findings", content.get("findings", []))
+            elif isinstance(content, list):
+                validated = content
+            else:
+                validated = []
+            
+            context.setdefault("validated_findings", []).extend(validated)
+        
+        elif node.type == TaskType.EXTRACT_CLAIMS:
+            # Store claims
+            if isinstance(content, dict):
+                claims = content.get("claims", content.get("claim_objects", []))
+            elif isinstance(content, list):
+                claims = content
+            else:
+                claims = []
+            
+            context.setdefault("claims", []).extend(claims)
+    
+    def _merge_evidence(
+        self,
+        node: TaskNode,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Merge evidence from multiple sources.
+        
+        Internal operation that doesn't need an agent.
+        Falls back to raw findings when validated_findings is empty
+        (e.g. validation node failed or was skipped).
+        """
+        findings = context.get("validated_findings", [])
+        if not findings:
+            findings = context.get("findings", [])
+        claims = context.get("claims", [])
+        
+        # Also backfill validated_findings so downstream nodes see them
+        if findings and not context.get("validated_findings"):
+            context["validated_findings"] = findings
+        
+        return {
+            "merged_findings": findings,
+            "merged_claims": claims,
+            "finding_count": len(findings),
+            "claim_count": len(claims),
+        }
+    
+    def _deduplicate_claims(
+        self,
+        node: TaskNode,
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Deduplicate claims based on similarity.
+        
+        Simple text-based deduplication for now.
+        """
+        claims = context.get("claims", [])
+        
+        seen_texts = set()
+        unique_claims = []
+        
+        for claim in claims:
+            text = claim.get("normalized_text", claim.get("claim", "")).lower()
+            if text and text not in seen_texts:
+                seen_texts.add(text)
+                unique_claims.append(claim)
+        
+        return {
+            "original_count": len(claims),
+            "unique_count": len(unique_claims),
+            "deduplicated_claims": unique_claims,
+        }
+    
+    def shutdown(self):
+        """Shutdown the executor."""
+        self.executor.shutdown(wait=True)
