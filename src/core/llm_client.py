@@ -387,3 +387,392 @@ class LLMClient:
                     self._record_usage(usage)
                     
                     return LLMResponse(
+                        content=content,
+                        model=model_name,
+                        usage=usage,
+                        finish_reason=finish_reason,
+                    )
+                except (KeyError, IndexError) as e:
+                    # Handle cases where safety blocks content
+                    if "candidates" in data and not data["candidates"][0].get("content"):
+                        finish_reason = data["candidates"][0].get("finishReason", "unknown")
+                        raise Exception(f"Gemini blocked content. Reason: {finish_reason}")
+                    raise Exception(f"Failed to parse Gemini response: {data}")
+                    
+            except Exception as e:
+                error_msg = str(e)
+                response_obj = getattr(e, "response", None)
+                if response_obj is not None:
+                    try:
+                        error_msg += f". Details: {response_obj.text}"
+                    except Exception:
+                        pass
+                if attempt < max_retries - 1 and "429" in error_msg:
+                    time.sleep((attempt + 1) * 15)
+                    continue
+                raise Exception(f"Gemini API Error: {error_msg}")
+        
+        raise Exception("Gemini API Error: Max retries exceeded due to rate limiting")
+
+    def _run_coroutine_sync(self, coro):
+        """Run an async coroutine from sync code, even if an event loop is already running."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+        result: Dict[str, Any] = {}
+        exception_holder: Dict[str, Any] = {}
+
+        def runner():
+            try:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                result["value"] = new_loop.run_until_complete(coro)
+                new_loop.close()
+            except Exception as e:
+                exception_holder["exception"] = e
+
+        thread = threading.Thread(target=runner)
+        thread.start()
+        thread.join()
+        
+        if "exception" in exception_holder:
+            raise exception_holder["exception"]
+        
+        return result.get("value")
+
+    def _chat_cerebras(self, messages, model_name, temperature, max_tokens, system_prompt) -> LLMResponse:
+        """Execute chat via Cerebras using async HTTPX client with OpenAI-compatible schema.
+        Includes retry with exponential backoff for 429/5xx errors."""
+        if system_prompt and messages and messages[0].get("role") != "system":
+            messages = [{"role": "system", "content": system_prompt}] + messages
+
+        max_retries = 6
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                result = self._run_coroutine_sync(
+                    self._cerebras_call(messages=messages, model=model_name, temperature=temperature, max_tokens=max_tokens)
+                )
+                if not result:
+                    raise Exception("Empty response from Cerebras call")
+                content, usage, finish_reason = result
+                self._record_usage(usage)
+                return LLMResponse(
+                    content=content,
+                    model=model_name,
+                    usage=usage,
+                    finish_reason=finish_reason,
+                )
+            except Exception as e:
+                last_error = e
+                error_msg = str(e)
+                # Retry on rate limit (429) or server errors (5xx)
+                if attempt < max_retries - 1 and ("429" in error_msg or "HTTP 5" in error_msg or "Request failed" in error_msg):
+                    wait_time = min((attempt + 1) * 3, 15)  # 3s, 6s, 9s, 12s, 15s
+                    print(f"[LLM] Cerebras error: {error_msg[:100]}. Retrying in {wait_time}s (attempt {attempt+1}/{max_retries})...")
+                    time.sleep(wait_time)
+                    continue
+                raise Exception(f"Cerebras API Error: {e}")
+        
+        raise Exception(f"Cerebras API Error: Max retries exceeded. Last error: {last_error}")
+
+    def _record_usage(self, usage: Dict[str, int]) -> None:
+        """Track usage totals, per-provider breakdown, and cost."""
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+
+        self.total_tokens_used += total_tokens
+        self.total_prompt_tokens += prompt_tokens
+        self.total_completion_tokens += completion_tokens
+
+        provider = self.provider or "unknown"
+        self.model_usage_breakdown[provider] = self.model_usage_breakdown.get(provider, 0) + total_tokens
+
+        # Compute cost from pricing table
+        rates = self.COST_PER_1K.get(provider, {"prompt": 0.0, "completion": 0.0})
+        cost = (prompt_tokens * rates["prompt"] + completion_tokens * rates["completion"]) / 1000.0
+        self.total_cost += cost
+
+    async def _cerebras_call(self, messages: List[Dict[str, Any]], model: str, temperature: float = 0.7, max_tokens: int = 8192) -> Tuple[str, Dict[str, int], str]:
+        """Async Cerebras call using httpx; returns content, usage, finish_reason."""
+        url = "https://api.cerebras.ai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.cerebras_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response else "unknown"
+            detail = e.response.text if e.response is not None else str(e)
+            raise Exception(f"HTTP {status}: {detail}")
+        except httpx.RequestError as e:
+            raise Exception(f"Request failed: {e}")
+
+        try:
+            data = response.json()
+        except ValueError:
+            raise Exception("Invalid JSON response from Cerebras")
+
+        try:
+            choice = data.get("choices", [])[0]
+            message = choice.get("message", {})
+            content = message.get("content", "")
+            finish_reason = choice.get("finish_reason", "stop")
+        except Exception:
+            raise Exception(f"Malformed Cerebras response: {data}")
+
+        if not content:
+            raise Exception("Cerebras response missing content")
+
+        usage_meta = data.get("usage", {}) or {}
+        usage = {
+            "prompt_tokens": usage_meta.get("prompt_tokens", 0),
+            "completion_tokens": usage_meta.get("completion_tokens", 0),
+            "total_tokens": usage_meta.get(
+                "total_tokens",
+                usage_meta.get("prompt_tokens", 0) + usage_meta.get("completion_tokens", 0),
+            ),
+        }
+
+        return content, usage, finish_reason
+    
+    # V2: Adaptive Model Routing
+    def route_model(
+        self,
+        task_type: str,
+        model_hint: str = "medium",
+        budget_remaining_ms: Optional[int] = None,
+    ) -> str:
+        """
+        V2: Select model based on task type, hint, and budget.
+        
+        Args:
+            task_type: Type of task (sanitize, validate, synthesize, etc.)
+            model_hint: Hint from task graph (small, medium, large)
+            budget_remaining_ms: Optional time budget remaining
+            
+        Returns:
+            Model name to use
+        """
+        # Determine tier from task type or hint
+        tier = self.TASK_ROUTING.get(task_type, model_hint)
+        
+        # Downgrade if budget is tight
+        if budget_remaining_ms is not None and budget_remaining_ms < 2000:
+            if tier == "large":
+                tier = "medium"
+            elif tier == "medium":
+                tier = "small"
+        
+        # Get available models for tier
+        models = self.MODEL_TIERS.get(tier, self.MODEL_TIERS["medium"])
+        
+        # Return first available model in tier
+        # Could be enhanced with load balancing, cost optimization
+        return models[0] if models else self.MODELS["default"]
+
+    def estimate_complexity(self, query: str) -> float:
+        """Heuristic complexity estimate (0–1) for routing/analytics."""
+        if not query:
+            return 0.0
+
+        length_score = min(len(query) / 600.0, 1.0)
+        keywords = [
+            "compare",
+            "tradeoff",
+            "architecture",
+            "design",
+            "benchmark",
+            "multi-step",
+        ]
+        keyword_hits = sum(1 for k in keywords if k.lower() in query.lower())
+        keyword_score = min(keyword_hits * 0.15, 0.6)
+
+        score = min(max(length_score * 0.5 + keyword_score, 0.0), 1.0)
+        return score
+    
+    def chat_with_routing(
+        self,
+        messages: List[Dict[str, str]],
+        task_type: str = "default",
+        model_hint: str = "medium",
+        task_id: Optional[str] = None,
+        budget_ms: Optional[int] = None,
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        system_prompt: Optional[str] = None,
+    ) -> LLMResponse:
+        """
+        V2: Chat with automatic model routing.
+        
+        Args:
+            messages: Chat messages
+            task_type: Type of task for routing
+            model_hint: Model tier hint
+            task_id: Optional task ID for budget tracking
+            budget_ms: Optional time budget
+            temperature: LLM temperature
+            max_tokens: Max tokens
+            system_prompt: Optional system prompt
+            
+        Returns:
+            LLMResponse
+        """
+        # Get remaining budget for task
+        remaining = self._task_budgets.get(task_id, budget_ms) if task_id else budget_ms
+        
+        # Route to appropriate model
+        model = self.route_model(task_type, model_hint, remaining)
+        complexity = self._complexity_from_messages(messages)
+        
+        # Execute chat
+        start_time = time.time()
+        response = self.chat(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+        )
+        elapsed_ms = int((time.time() - start_time) * 1000)
+        
+        # Update budget tracking
+        if task_id:
+            current = self._task_budgets.get(task_id, budget_ms or 60000)
+            self._task_budgets[task_id] = max(0, current - elapsed_ms)
+            self._task_token_usage[task_id] = (
+                self._task_token_usage.get(task_id, 0) + response.usage.get("total_tokens", 0)
+            )
+
+        response.metadata.update({
+            "provider": self.provider,
+            "model": model,
+            "task_type": task_type,
+            "complexity": complexity,
+            "latency_ms": elapsed_ms,
+        })
+        print(f"[LLM] {response.metadata}")
+        
+        return response
+    
+    def set_task_budget(self, task_id: str, budget_ms: int) -> None:
+        """V2: Set budget for a task."""
+        self._task_budgets[task_id] = budget_ms
+    
+    def get_task_usage(self, task_id: str) -> Dict[str, Any]:
+        """V2: Get usage stats for a task."""
+        return {
+            "budget_remaining_ms": self._task_budgets.get(task_id, 0),
+            "tokens_used": self._task_token_usage.get(task_id, 0),
+        }
+    
+    def chat_stream(
+        self,
+        messages: List[Dict[str, str]],
+        model: str = "default",
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        system_prompt: Optional[str] = None,
+    ) -> Generator[str, None, None]:
+        """Stream a chat completion response."""
+        model_name = self.MODELS.get(model, model)
+        
+        # Common OpenAI/OpenRouter/Together streaming logic
+        if self.provider in ["openrouter", "together"]:
+            if system_prompt:
+                messages = [{"role": "system", "content": system_prompt}] + messages
+
+            if self.client is None:
+                raise RuntimeError("Chat client not initialized")
+            response = self.client.chat.completions.create(
+                model=model_name,
+                messages=cast(Any, messages),
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            response = cast(Any, response)
+
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+
+        elif self.provider == "google":
+            # Simple non-streaming fallback for now
+            response = self._chat_google(messages, model_name, temperature, max_tokens, system_prompt)
+            yield response.content
+
+    def _complexity_from_messages(self, messages: List[Dict[str, Any]]) -> float:
+        """Extract a user-visible text and estimate complexity."""
+        if not messages:
+            return 0.0
+        # Prefer first user message; fallback to joined content
+        user_msgs = [m.get("content", "") for m in messages if m.get("role") == "user"]
+        text = user_msgs[0] if user_msgs else " ".join([m.get("content", "") for m in messages])
+        return self.estimate_complexity(text)
+
+    def generate(
+        self,
+        prompt: str,
+        task_type: str = "default",
+        temperature: float = 0.7,
+        max_tokens: int = 8192,
+        system_prompt: Optional[str] = None,
+    ) -> LLMResponse:
+        """Generate a response from a single prompt string.
+
+        Convenience wrapper used by ClaimChallenger, ArchitectureGenerator,
+        ComparisonSynthesizer, and ResearchExporter.
+        """
+        messages = [{"role": "user", "content": prompt}]
+        return self.chat_with_routing(
+            messages=messages,
+            task_type=task_type,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+        )
+
+    def simple_query(
+        self,
+        query: str,
+        model: str = "default",
+        system_prompt: Optional[str] = None,
+    ) -> str:
+        """Simple single-turn query."""
+        messages = [{"role": "user", "content": query}]
+        response = self.chat(messages, model=model, system_prompt=system_prompt)
+        return response.content
+    
+    def get_usage_stats(self) -> Dict[str, Any]:
+        """Get current usage statistics."""
+        return {
+            "total_tokens": self.total_tokens_used,
+            "prompt_tokens": self.total_prompt_tokens,
+            "completion_tokens": self.total_completion_tokens,
+            "estimated_cost_usd": self.total_cost,
+            "model_usage_breakdown": dict(self.model_usage_breakdown),
+        }
+
+
+# Convenience function for quick queries
+def query_llm(
+    query: str,
+    model: str = "default",
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Quick utility function for single LLM queries."""
+    client = LLMClient()
+    return client.simple_query(query, model=model, system_prompt=system_prompt)
