@@ -127,3 +127,133 @@ class Source:
         )
 
 
+@dataclass
+class Session:
+    """
+    A research session tracking the state of an investigation.
+    
+    Sessions maintain context across multiple search iterations
+    and link to snapshots for compression.
+    """
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: Optional[str] = None
+    query_text: str = ""
+    summary_snapshot_id: Optional[str] = None
+    iterations: int = 0
+    status: str = "active"                      # active, complete, failed
+    task_graph_id: Optional[str] = None         # Link to hierarchical planner task graph
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "query_text": self.query_text,
+            "summary_snapshot_id": self.summary_snapshot_id,
+            "iterations": self.iterations,
+            "status": self.status,
+            "task_graph_id": self.task_graph_id,
+            "metadata": self.metadata,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Session":
+        return cls(
+            id=data.get("id", str(uuid.uuid4())),
+            user_id=data.get("user_id"),
+            query_text=data.get("query_text", ""),
+            summary_snapshot_id=data.get("summary_snapshot_id"),
+            iterations=data.get("iterations", 0),
+            status=data.get("status", "active"),
+            task_graph_id=data.get("task_graph_id"),
+            metadata=data.get("metadata", {}),
+            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
+            updated_at=datetime.fromisoformat(data["updated_at"]) if "updated_at" in data else datetime.now(),
+        )
+
+
+@dataclass
+class SummarySnapshot:
+    """
+    A compressed snapshot of session state.
+    
+    Used for long-term memory compression to stay within
+    LLM context limits while preserving key information.
+    """
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    session_id: str = ""
+    compressed_text: str = ""                   # Compressed summary (<=1024 tokens)
+    embedding: Optional[List[float]] = None     # Vector for retrieval
+    size_bytes: int = 0
+    iteration_number: int = 0                   # Which iteration this snapshot represents
+    claim_ids: List[str] = field(default_factory=list)  # Claims included in snapshot
+    created_at: datetime = field(default_factory=datetime.now)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "compressed_text": self.compressed_text,
+            "embedding": self.embedding,
+            "size_bytes": self.size_bytes,
+            "iteration_number": self.iteration_number,
+            "claim_ids": self.claim_ids,
+            "created_at": self.created_at.isoformat(),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SummarySnapshot":
+        return cls(
+            id=data.get("id", str(uuid.uuid4())),
+            session_id=data.get("session_id", ""),
+            compressed_text=data.get("compressed_text", ""),
+            embedding=data.get("embedding"),
+            size_bytes=data.get("size_bytes", 0),
+            iteration_number=data.get("iteration_number", 0),
+            claim_ids=data.get("claim_ids", []),
+            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
+        )
+
+
+@dataclass
+class EvidenceEdge:
+    """
+    A relationship between a claim and a source.
+    
+    Forms the edges of the evidence graph, linking
+    claims to their supporting or contradicting sources.
+    """
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    from_claim_id: str = ""
+    to_source_id: str = ""
+    relation: EvidenceRelation = EvidenceRelation.MENTIONS
+    strength: float = 0.5                       # 0-1 strength of relationship
+    validation_notes: str = ""                  # Notes from validation
+    created_at: datetime = field(default_factory=datetime.now)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "from_claim_id": self.from_claim_id,
+            "to_source_id": self.to_source_id,
+            "relation": self.relation.value,
+            "strength": self.strength,
+            "validation_notes": self.validation_notes,
+            "created_at": self.created_at.isoformat(),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "EvidenceEdge":
+        return cls(
+            id=data.get("id", str(uuid.uuid4())),
+            from_claim_id=data.get("from_claim_id", ""),
+            to_source_id=data.get("to_source_id", ""),
+            relation=EvidenceRelation(data.get("relation", "mentions")),
+            strength=data.get("strength", 0.5),
+            validation_notes=data.get("validation_notes", ""),
+            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
+        )
