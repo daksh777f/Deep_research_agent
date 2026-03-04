@@ -220,3 +220,225 @@ JSON citations:"""
         
         return citations[:self.MAX_CITATIONS_PER_SOURCE]
     
+    def prioritize_citations(
+        self,
+        citations: List[Citation],
+        query: str,
+    ) -> List[Citation]:
+        """
+        Prioritize citations by relevance to the research query.
+        
+        Args:
+            citations: List of extracted citations
+            query: Research query for context
+            
+        Returns:
+            Sorted list of citations
+        """
+        # Simple scoring - could be enhanced with embeddings
+        query_terms = set(query.lower().split())
+        
+        for citation in citations:
+            # Boost score if title contains query terms
+            title_terms = set(citation.title.lower().split())
+            overlap = len(query_terms.intersection(title_terms))
+            if overlap > 0:
+                citation.relevance_score = min(1.0, citation.relevance_score + 0.1 * overlap)
+            
+            # Boost academic sources
+            if citation.source_type == "paper":
+                citation.relevance_score = min(1.0, citation.relevance_score + 0.1)
+            
+            # Boost if has DOI
+            if citation.doi:
+                citation.relevance_score = min(1.0, citation.relevance_score + 0.1)
+        
+        # Sort by relevance
+        return sorted(citations, key=lambda c: -c.relevance_score)
+    
+    async def crawl_citation(
+        self,
+        citation: Citation,
+        current_depth: int,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch and process a single citation.
+        
+        Args:
+            citation: Citation to crawl
+            current_depth: Current crawl depth
+            
+        Returns:
+            Fetched content or None
+        """
+        if not self.search_agent:
+            return None
+        
+        # Build search query from citation
+        search_query = citation.title
+        if citation.authors:
+            search_query += f" {citation.authors[0]}"
+        if citation.year:
+            search_query += f" {citation.year}"
+        
+        # Use search agent to find the source
+        try:
+            result = self.search_agent.execute({
+                "query": search_query,
+                "num_results": 1,
+            })
+            
+            if result.success and result.content:
+                findings = result.content.get("findings", [])
+                if findings:
+                    finding = findings[0]
+                    finding["citation_depth"] = current_depth
+                    finding["cited_by"] = citation.to_dict()
+                    return finding
+        except Exception as e:
+            self.log(f"Failed to fetch citation: {e}")
+        
+        return None
+    
+    async def crawl_citations_recursive(
+        self,
+        source_content: str,
+        source_url: str,
+        query: str,
+        current_depth: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Recursively crawl citations with depth limiting.
+        
+        Args:
+            source_content: Content to extract citations from
+            source_url: URL of the source
+            query: Research query for prioritization
+            current_depth: Current crawl depth
+            
+        Returns:
+            List of crawled sources with citation metadata
+        """
+        if current_depth >= self.MAX_DEPTH:
+            return []
+        
+        if self._citation_count >= self.MAX_TOTAL_CITATIONS:
+            return []
+        
+        if source_url in self._visited_urls:
+            return []
+        
+        self._visited_urls.add(source_url)
+        
+        # Extract citations
+        citations = self.extract_citations(source_content, source_url)
+        if not citations:
+            citations = self.extract_citations_heuristic(source_content)
+        
+        # Prioritize
+        citations = self.prioritize_citations(citations, query)
+        
+        # Crawl top citations
+        crawled_sources = []
+        for citation in citations[:5]:  # Limit per level
+            if self._citation_count >= self.MAX_TOTAL_CITATIONS:
+                break
+            
+            url = citation.url or ""
+            if url and url in self._visited_urls:
+                continue
+            
+            source = await self.crawl_citation(citation, current_depth + 1)
+            if source:
+                self._citation_count += 1
+                crawled_sources.append(source)
+                
+                # Recursively crawl if not at max depth
+                if current_depth + 1 < self.MAX_DEPTH:
+                    nested = await self.crawl_citations_recursive(
+                        source.get("content", ""),
+                        source.get("url", source.get("source", "")),
+                        query,
+                        current_depth + 1,
+                    )
+                    crawled_sources.extend(nested)
+        
+        return crawled_sources
+    
+    def reset_crawler(self):
+        """Reset crawler state for new session."""
+        self._visited_urls.clear()
+        self._citation_count = 0
+    
+    def execute(self, input_data: Dict[str, Any]) -> AgentResult:
+        """
+        Execute the citation crawler.
+        
+        Args:
+            input_data: Must contain 'sources' or 'content', and 'query'
+            
+        Returns:
+            AgentResult with crawled citations
+        """
+        sources = input_data.get("sources", [])
+        content = input_data.get("content", "")
+        query = input_data.get("query", "")
+        max_depth = input_data.get("max_depth", self.MAX_DEPTH)
+        
+        self.MAX_DEPTH = min(max_depth, 5)  # Safety cap
+        self.reset_crawler()
+        
+        try:
+            all_citations = []
+            
+            if sources:
+                # Extract from multiple sources
+                for source in sources:
+                    src_content = source.get("content", source.get("text", ""))
+                    src_url = source.get("url", source.get("source", ""))
+                    
+                    citations = self.extract_citations(src_content, src_url)
+                    if not citations:
+                        citations = self.extract_citations_heuristic(src_content)
+                    
+                    citations = self.prioritize_citations(citations, query)
+                    all_citations.extend([c.to_dict() for c in citations])
+                    
+            elif content:
+                # Single content extraction
+                citations = self.extract_citations(content)
+                if not citations:
+                    citations = self.extract_citations_heuristic(content)
+                
+                citations = self.prioritize_citations(citations, query)
+                all_citations = [c.to_dict() for c in citations]
+            
+            # Deduplicate by title
+            seen_titles = set()
+            unique_citations = []
+            for c in all_citations:
+                title_key = c.get("title", "").lower()[:50]
+                if title_key and title_key not in seen_titles:
+                    seen_titles.add(title_key)
+                    unique_citations.append(c)
+            
+            return AgentResult(
+                success=True,
+                content={
+                    "citations": unique_citations[:self.MAX_TOTAL_CITATIONS],
+                    "count": len(unique_citations),
+                },
+                agent_name="CitationCrawlerAgent",
+                metadata={
+                    "sources_processed": len(sources) if sources else 1,
+                    "max_depth": self.MAX_DEPTH,
+                },
+            )
+            
+        except Exception as e:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name="CitationCrawlerAgent",
+                error=str(e),
+            )
