@@ -226,3 +226,231 @@ def update_session_status(session_id: str, status: str) -> None:
         @firestore_module.transactional
         def _txn(transaction):
             ref = db.collection("research_sessions").document(session_id)
+            transaction.update(ref, {
+                "status": status,
+                "updated_at": _now(),
+            })
+
+        _txn(db.transaction())
+    except Exception as exc:
+        logger.error("Firestore update_session_status failed: %s", exc)
+
+
+def update_session_field(session_id: str, **fields: Any) -> None:
+    """
+    Update arbitrary fields on a session document.
+
+    Uses a Firestore **transaction** to guarantee atomicity.
+    """
+    _require_db()
+    try:
+        fields["updated_at"] = _now()
+
+        @firestore_module.transactional
+        def _txn(transaction):
+            ref = db.collection("research_sessions").document(session_id)
+            transaction.update(ref, fields)
+
+        _txn(db.transaction())
+    except Exception as exc:
+        logger.error("Firestore update_session_field failed: %s", exc)
+
+
+def list_sessions(user_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """List recent sessions, optionally filtered by user."""
+    _require_db()
+    try:
+        ref = db.collection("research_sessions")
+        if user_id:
+            ref = ref.where(filter=FieldFilter("user_id", "==", user_id))
+        docs = ref.order_by("created_at", direction="DESCENDING").limit(limit).stream()
+        return [{**doc.to_dict(), "id": doc.id} for doc in docs]
+    except Exception as exc:
+        logger.error("Firestore list_sessions failed: %s", exc)
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Results operations
+# ---------------------------------------------------------------------------
+
+def save_results(
+    session_id: str,
+    report: str,
+    evidence_summary: Optional[Dict[str, Any]] = None,
+    task_graph_summary: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Persist the final research output.
+
+    • Large reports are truncated; full version overflows to disk.
+    • Large evidence / task_graph payloads are also overflowed to prevent
+      hitting the Firestore 1 MB document limit.
+    • The result write and session status update are executed inside a
+      Firestore **transaction** to prevent partial writes on contention.
+    """
+    _require_db()
+    try:
+        report_data = _truncate_report(session_id, report)
+        guarded = _guard_evidence(
+            session_id,
+            evidence_summary or {},
+            task_graph_summary or {},
+        )
+
+        payload: Dict[str, Any] = {
+            "report": report_data["report"],
+            "evidence_summary": guarded["evidence_summary"],
+            "task_graph_summary": guarded["task_graph_summary"],
+        }
+        if report_data["report_overflow_path"]:
+            payload["report_overflow_path"] = report_data["report_overflow_path"]
+        if guarded["evidence_overflow_path"]:
+            payload["evidence_overflow_path"] = guarded["evidence_overflow_path"]
+        if guarded["task_graph_overflow_path"]:
+            payload["task_graph_overflow_path"] = guarded["task_graph_overflow_path"]
+
+        # --- Atomic transaction: write results + mark session complete ---
+        @firestore_module.transactional
+        def _commit_results(transaction):
+            result_ref = db.collection("research_results").document(session_id)
+            session_ref = db.collection("research_sessions").document(session_id)
+            transaction.set(result_ref, payload)
+            transaction.update(session_ref, {
+                "status": "complete",
+                "has_result": True,
+                "updated_at": _now(),
+            })
+
+        _commit_results(db.transaction())
+        logger.info("Firestore results saved (transactional) for session %s", session_id)
+    except Exception as exc:
+        logger.error("Firestore save_results failed for %s: %s", session_id, exc)
+        update_session_status(session_id, "failed")
+        raise
+
+
+def get_results(session_id: str) -> Optional[Dict[str, Any]]:
+    """Load persisted results for a session."""
+    _require_db()
+    try:
+        doc = db.collection("research_results").document(session_id).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception as exc:
+        logger.error("Firestore get_results failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Metrics operations
+# ---------------------------------------------------------------------------
+
+def save_metrics(session_id: str, metrics: Dict[str, Any]) -> None:
+    """Save execution metrics for a research session."""
+    _require_db()
+    try:
+        db.collection("research_metrics").document(session_id).set(metrics)
+    except Exception as exc:
+        logger.error("Firestore save_metrics failed for %s: %s", session_id, exc)
+
+
+def get_metrics(session_id: str) -> Optional[Dict[str, Any]]:
+    """Load metrics for a session."""
+    _require_db()
+    try:
+        doc = db.collection("research_metrics").document(session_id).get()
+        return doc.to_dict() if doc.exists else None
+    except Exception as exc:
+        logger.error("Firestore get_metrics failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# User preferences
+# ---------------------------------------------------------------------------
+
+def save_user_preferences(user_id: str, preferences: Dict[str, Any]) -> None:
+    """Create or update user preferences."""
+    _require_db()
+    try:
+        db.collection("users").document(user_id).set({
+            "preferences": preferences,
+            "updated_at": _now(),
+        }, merge=True)
+    except Exception as exc:
+        logger.error("Firestore save_user_preferences failed for %s: %s", user_id, exc)
+
+
+def get_user_preferences(user_id: str) -> Dict[str, Any]:
+    """Load user preferences.  Returns empty dict if not found."""
+    _require_db()
+    try:
+        doc = db.collection("users").document(user_id).get()
+        if doc.exists:
+            return doc.to_dict().get("preferences", {})
+    except Exception as exc:
+        logger.error("Firestore get_user_preferences failed: %s", exc)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# Research history (convenience)
+# ---------------------------------------------------------------------------
+
+def get_research_history(user_id: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Return a summary list of past sessions with result availability.
+
+    Uses the ``has_result`` flag stored on each session document
+    (set atomically inside ``save_results``) to avoid the previous
+    O(N) per-session ``get_results`` round-trip.
+    """
+    sessions = list_sessions(user_id=user_id, limit=limit)
+    return [
+        {
+            "id": s.get("id", ""),
+            "query": s.get("query", ""),
+            "mode": s.get("mode", "deep"),
+            "status": s.get("status", "unknown"),
+            "created_at": s.get("created_at"),
+            "has_result": s.get("has_result", False),
+            "chat_name": s.get("chat_name"),  # Include stored chat name if available
+        }
+        for s in sessions
+    ]
+
+# ---------------------------------------------------------------------------
+# Deletion operations
+# ---------------------------------------------------------------------------
+
+def delete_session(session_id: str) -> bool:
+    """
+    Delete a research session and all associated data (results, metrics).
+    
+    Uses a Firestore **batch** to ensure all documents are deleted atomically.
+    
+    Returns:
+        True if deletion was successful, False otherwise.
+    """
+    _require_db()
+    try:
+        batch = db.batch()
+        
+        # Delete session document
+        session_ref = db.collection("research_sessions").document(session_id)
+        batch.delete(session_ref)
+        
+        # Delete results document if it exists
+        results_ref = db.collection("research_results").document(session_id)
+        batch.delete(results_ref)
+        
+        # Delete metrics document if it exists
+        metrics_ref = db.collection("research_metrics").document(session_id)
+        batch.delete(metrics_ref)
+        
+        batch.commit()
+        logger.info("Firestore session deleted: %s", session_id)
+        return True
+    except Exception as exc:
+        logger.error("Firestore delete_session failed for %s: %s", session_id, exc)
+        return False
