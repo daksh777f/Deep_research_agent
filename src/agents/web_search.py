@@ -168,3 +168,173 @@ class WebSearchAgent(BaseAgent):
     def _mock_search(self, query: str, num_results: int = 5) -> List[Dict[str, Any]]:
         """
         Generate mock search results for development/testing.
+        Uses LLM to generate plausible search results.
+        """
+        self.log("Using mock search (no API key configured)")
+        
+        mock_prompt = f"""Generate {num_results} realistic web search results for this query: "{query}"
+
+For each result, provide:
+- A realistic title
+- A plausible URL
+- A brief content snippet (100-200 words)
+
+Format as JSON array:
+[
+    {{"title": "...", "url": "...", "content": "..."}},
+    ...
+]
+"""
+        
+        response = self.llm.chat(
+            messages=[{"role": "user", "content": mock_prompt}],
+            model="fast",
+            temperature=0.7,
+        )
+        
+        try:
+            content = response.content
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0]
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0]
+            
+            results = json.loads(content.strip())
+            for r in results:
+                r["source"] = "mock"
+                r["score"] = 0.8
+            return results
+            
+        except:
+            return [{
+                "title": f"Search result for: {query}",
+                "url": "https://example.com",
+                "content": "Mock search result content.",
+                "source": "mock",
+                "score": 0.5,
+            }]
+    
+    def search(self, query: str, num_results: int = 5) -> List[Dict[str, Any]]:
+        """
+        Execute search using configured provider.
+        
+        Args:
+            query: Search query
+            num_results: Number of results
+            
+        Returns:
+            List of search results
+        """
+        if self.search_provider == "exa":
+            return self.search_exa(query, num_results)
+        elif self.search_provider == "tavily":
+            return self.search_tavily(query, num_results)
+        else:
+            return self._mock_search(query, num_results)
+    
+    def process_results(
+        self,
+        query: str,
+        results: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Process search results into standardized finding format.
+        
+        Args:
+            query: Original query
+            results: Raw search results
+            
+        Returns:
+            Processed findings ready for validation
+        """
+        from urllib.parse import urlparse
+
+        findings = []
+        for hop_idx, result in enumerate(results):
+            url = result.get("url", "Unknown")
+            domain = ""
+            try:
+                domain = urlparse(url).netloc.replace("www.", "")
+            except Exception:
+                domain = "unknown"
+
+            # Build citation_chain entry for Source Genome Tracer (Part 4)
+            citation_hop = {
+                "hop": hop_idx + 1,
+                "url": url,
+                "domain": domain,
+                "domain_trust": result.get("score", 0.5),
+                "claim_text_at_this_hop": (result.get("content") or "")[:200],
+                "source_type": result.get("source", self.search_provider),
+                "fetch_method": self.search_provider,
+            }
+
+            finding = {
+                "content": result.get("content", ""),
+                "source": url,
+                "agent": "web_search",
+                "title": result.get("title", ""),
+                "search_score": result.get("score", 0),
+                "reliability_score": None,  # To be filled by SVA
+                "domain": domain,
+                "citation_chain": [citation_hop],
+            }
+            findings.append(finding)
+            
+            # Add to context if available
+            if self.context and self.context.current_session_id:
+                self.context.add_finding(
+                    content=finding["content"],
+                    source=finding["source"],
+                    agent="web_search",
+                )
+        
+        return findings
+    
+    def execute(self, input_data: Dict[str, Any]) -> AgentResult:
+        """
+        Execute the web search agent.
+        
+        Args:
+            input_data: Must contain 'query' key
+            
+        Returns:
+            AgentResult with search findings
+        """
+        query = input_data.get("query")
+        if not query:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name=self.name,
+                error="No query provided",
+            )
+        
+        num_results = input_data.get("num_results", 5)
+        
+        try:
+            # Execute search
+            self.log(f"Searching for: {query}")
+            raw_results = self.search(query, num_results)
+            
+            # Process into findings
+            findings = self.process_results(query, raw_results)
+            
+            return AgentResult(
+                success=True,
+                content=findings,
+                agent_name=self.name,
+                metadata={
+                    "query": query,
+                    "provider": self.search_provider,
+                    "num_results": len(findings),
+                },
+            )
+        
+        except Exception as e:
+            return AgentResult(
+                success=False,
+                content=None,
+                agent_name=self.name,
+                error=str(e),
+            )
