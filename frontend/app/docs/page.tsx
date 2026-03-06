@@ -190,3 +190,196 @@ export default function DocsPage() {
                     </div>
                     <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5">
                         <h3 className="text-lg font-semibold text-white">Deep mode</h3>
+                        <ul className="mt-3 space-y-2 text-sm text-slate-300">
+                            <li>max_time_ms: 480,000</li>
+                            <li>max_iterations: 3</li>
+                            <li>min_sources: 6</li>
+                            <li>top_k: 8</li>
+                            <li>Includes validation + reflexion</li>
+                            <li>Uses full model tier routing</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <section id="task-graph" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Task graph & planning</h2>
+                    <p className="text-sm text-slate-400">HierarchicalPlannerAgent builds a DAG of tasks.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>Search tasks: SEARCH_WEB, SEARCH_ACADEMIC, SEARCH_TECHNICAL, SEARCH_CITATION</li>
+                        <li>Extraction: EXTRACT_CLAIMS (depends on search results)</li>
+                        <li>Validation: VALIDATE_CLAIMS (deep mode only)</li>
+                        <li>Merge: MERGE_EVIDENCE (internal aggregation)</li>
+                        <li>Reflexion: REFLEXION (deep mode only)</li>
+                        <li>Synthesis: SYNTHESIZE_REPORT (final report)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="evidence-graph" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Evidence graph</h2>
+                    <p className="text-sm text-slate-400">Claims and sources are linked with explicit relations.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>Claim: text, normalized_text, confidence, provenance</li>
+                        <li>Source: url, title, reliability_score, excerpt, metadata</li>
+                        <li>EvidenceEdge: supports, contradicts, mentions</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="reflexion" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Reflexion & replanning</h2>
+                    <p className="text-sm text-slate-400">Critique loop can trigger task graph replanning.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>Critique outputs: quality, coverage, gaps, refined_queries</li>
+                        <li>Replan triggers when gaps &gt;= 2 or quality &lt; 0.5</li>
+                        <li>Disabled in quick mode</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="model-routing" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Model routing</h2>
+                    <p className="text-sm text-slate-400">LLMClient routes tasks via model tiers and env config.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>DEFAULT_MODEL and FAST_MODEL define baseline tiers</li>
+                        <li>Quick mode forces all tiers to fast model</li>
+                        <li>Providers supported via env keys (Gemini, Together, OpenRouter, Cerebras)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="firestore" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Firebase Firestore</h2>
+                    <p className="text-sm text-slate-400">FirestoreStore persists sessions, results, and metrics.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>Sessions include query, mode, status, and timestamps</li>
+                        <li>Results stored with report text, evidence summary, and task graph</li>
+                        <li>Metrics track latency, token usage, and model info</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="qdrant" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Qdrant vector store</h2>
+                    <p className="text-sm text-slate-400">Semantic memory uses Qdrant for similarity search.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>QDRANT_URL and QDRANT_API_KEY for cloud, else local at http://localhost:6333</li>
+                        <li>Collection name: research_memory</li>
+                        <li>Vector size controlled by EMBEDDING_DIM (default 1536)</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="persistent-memory" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Persistent memory</h2>
+                    <p className="text-sm text-slate-400">Summary snapshots compress long sessions for recall.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <ul className="space-y-2">
+                        <li>SummarySnapshot stores compressed_text, embeddings, and claim IDs</li>
+                        <li>MemoryAPI coordinates Firebase Firestore + Qdrant with in-memory fallbacks</li>
+                    </ul>
+                </div>
+            </section>
+
+            <section id="api" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">API endpoints</h2>
+                    <p className="text-sm text-slate-400">FastAPI server in server.py.</p>
+                </div>
+                <div className="space-y-3 text-sm text-slate-200">
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950 px-4 py-3">
+                        <code>POST /api/research</code>
+                    </div>
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950 px-4 py-3">
+                        <code>GET /api/research/&lt;session_id&gt;</code>
+                    </div>
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950 px-4 py-3">
+                        <code>GET /api/history</code>
+                    </div>
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950 px-4 py-3">
+                        <code>GET /api/health</code>
+                    </div>
+                </div>
+            </section>
+
+            <section id="env" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Environment variables</h2>
+                    <p className="text-sm text-slate-400">Configure providers and storage in .env.</p>
+                </div>
+                <div className="grid gap-4 lg:grid-cols-2">
+                    <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                        <p className="text-xs uppercase tracking-widest text-slate-400">LLM Providers</p>
+                        <ul className="mt-3 space-y-2">
+                            <li>OPENROUTER_API_KEY</li>
+                            <li>GEMINI_API_KEY</li>
+                            <li>TOGETHER_API_KEY</li>
+                            <li>CEREBRAS_API_KEY</li>
+                        </ul>
+                    </div>
+                    <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                        <p className="text-xs uppercase tracking-widest text-slate-400">Search</p>
+                        <ul className="mt-3 space-y-2">
+                            <li>EXA_API_KEY</li>
+                            <li>TAVILY_API_KEY</li>
+                            <li>FIRECRAWL_API_KEY</li>
+                        </ul>
+                    </div>
+                    <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                        <p className="text-xs uppercase tracking-widest text-slate-400">Model routing</p>
+                        <ul className="mt-3 space-y-2">
+                            <li>DEFAULT_MODEL</li>
+                            <li>FAST_MODEL</li>
+                        </ul>
+                    </div>
+                    <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                        <p className="text-xs uppercase tracking-widest text-slate-400">Storage</p>
+                        <ul className="mt-3 space-y-2">
+                            <li>FIREBASE_CREDENTIALS_PATH</li>
+                            <li>FIREBASE_AUTH_ENABLED (optional)</li>
+                            <li>QDRANT_URL (optional)</li>
+                            <li>QDRANT_API_KEY (optional)</li>
+                            <li>EMBEDDING_DIM (optional)</li>
+                        </ul>
+                    </div>
+                </div>
+            </section>
+
+            <section id="docker" className="space-y-6">
+                <div>
+                    <h2 className="text-2xl font-semibold text-white">Docker deployment</h2>
+                    <p className="text-sm text-slate-400">Kestra workflow engine is provided via docker-compose.yaml.</p>
+                </div>
+                <div className="rounded-2xl border border-slate-800/60 bg-slate-900/40 p-5 text-sm text-slate-300">
+                    <div className="rounded-xl border border-slate-800/80 bg-slate-950 px-4 py-3">
+                        <code>docker compose up -d</code>
+                    </div>
+                    <p className="mt-3 text-xs text-slate-400">
+                        This spins up Kestra plus Postgres for local orchestration flows in /kestra.
+                    </p>
+                </div>
+            </section>
+        </div>
+    );
+}
