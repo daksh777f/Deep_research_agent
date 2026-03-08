@@ -181,3 +181,186 @@ class ResearchExporter:
             buf.seek(0)
             return buf
 
+        return await asyncio.to_thread(_build)
+
+    # ------------------------------------------------------------------
+    # DOCX via python-docx
+    # ------------------------------------------------------------------
+
+    async def _export_docx(
+        self,
+        report: str,
+        sources: List[Dict],
+        query: str,
+        trust_metrics: Optional[Dict],
+    ) -> io.BytesIO:
+        try:
+            from docx import Document  # type: ignore
+            from docx.shared import Pt  # type: ignore
+        except ImportError:
+            logger.warning("python-docx not installed; falling back to markdown")
+            return self._export_markdown(report, sources, query, trust_metrics)
+
+        def _build():
+            doc = Document()
+            doc.add_heading(f"Research Report: {query}", level=0)
+
+            if trust_metrics:
+                doc.add_heading("Trust Metrics", level=1)
+                doc.add_paragraph(
+                    f"Confidence Score: {trust_metrics.get('confidence_score', 'N/A')}\n"
+                    f"Sources Analyzed: {trust_metrics.get('sources_analyzed', 0)}\n"
+                    f"Claims Verified: {trust_metrics.get('claims_verified', 0)}/{trust_metrics.get('claims_total', 0)}\n"
+                    f"Bias Risk: {trust_metrics.get('bias_risk', 'N/A')}"
+                )
+
+            doc.add_heading("Report", level=1)
+            # Process markdown-like report into paragraphs
+            for line in report.split("\n"):
+                line = line.strip()
+                if line.startswith("## "):
+                    doc.add_heading(line[3:], level=2)
+                elif line.startswith("### "):
+                    doc.add_heading(line[4:], level=3)
+                elif line.startswith("# "):
+                    doc.add_heading(line[2:], level=1)
+                elif line.startswith("- "):
+                    doc.add_paragraph(line[2:], style="List Bullet")
+                elif line:
+                    doc.add_paragraph(line)
+
+            doc.add_heading("Sources", level=1)
+            for i, src in enumerate(sources, 1):
+                doc.add_paragraph(
+                    f"{i}. {src.get('title', '')} — {src.get('url', '')}",
+                    style="List Number",
+                )
+
+            buf = io.BytesIO()
+            doc.save(buf)
+            buf.seek(0)
+            return buf
+
+        return await asyncio.to_thread(_build)
+
+    # ------------------------------------------------------------------
+    # Checklist (LLM-generated action items)
+    # ------------------------------------------------------------------
+
+    async def _export_checklist(self, report: str, query: str) -> io.BytesIO:
+        """Generate an actionable checklist derived from the research."""
+        if not self.llm:
+            return self._fallback_checklist(report, query)
+
+        prompt = (
+            "Based on the following research report, generate a concise actionable checklist "
+            "of 8-12 key action items. Format each as a markdown checkbox.\n\n"
+            f"Research Query: {query}\n\n"
+            f"Report (excerpt):\n{report[:3000]}\n\n"
+            "Return the checklist as markdown with - [ ] prefix for each item."
+        )
+
+        try:
+            resp = await asyncio.to_thread(
+                self.llm.generate, prompt, task_type="synthesize"
+            )
+            checklist = f"# Action Checklist: {query}\n\n{resp.content.strip()}\n"
+            buf = io.BytesIO()
+            buf.write(checklist.encode("utf-8"))
+            buf.seek(0)
+            return buf
+        except Exception as e:
+            logger.warning("Checklist generation failed: %s", e)
+            return self._fallback_checklist(report, query)
+
+    def _fallback_checklist(self, report: str, query: str) -> io.BytesIO:
+        lines = [f"# Action Checklist: {query}\n"]
+        lines.append("- [ ] Review research findings")
+        lines.append("- [ ] Verify key claims with additional sources")
+        lines.append("- [ ] Identify actionable insights")
+        lines.append("- [ ] Share findings with stakeholders")
+        lines.append("- [ ] Plan next research iteration")
+        buf = io.BytesIO()
+        buf.write("\n".join(lines).encode("utf-8"))
+        buf.seek(0)
+        return buf
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _build_html(
+        self,
+        report: str,
+        sources: List[Dict],
+        query: str,
+        trust_metrics: Optional[Dict],
+    ) -> str:
+        """Build styled HTML for PDF generation."""
+        try:
+            import markdown as md  # type: ignore
+            report_html = md.markdown(report, extensions=["tables", "fenced_code"])
+        except ImportError:
+            report_html = f"<pre>{report}</pre>"
+
+        trust_html = ""
+        if trust_metrics:
+            trust_html = f"""
+            <div class="metrics">
+                <h2>Trust Metrics</h2>
+                <p>Confidence: {trust_metrics.get('confidence_score', 'N/A')}</p>
+                <p>Sources: {trust_metrics.get('sources_analyzed', 0)}</p>
+                <p>Claims: {trust_metrics.get('claims_verified', 0)}/{trust_metrics.get('claims_total', 0)}</p>
+                <p>Bias Risk: {trust_metrics.get('bias_risk', 'N/A')}</p>
+            </div>
+            """
+
+        sources_html = "".join(
+            f'<li><a href="{s.get("url", "")}">{s.get("title", s.get("url", ""))}</a></li>'
+            for s in sources
+        )
+
+        return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {{ font-family: -apple-system, system-ui, sans-serif; color: #111; max-width: 800px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }}
+  h1 {{ color: #1a1a2e; border-bottom: 2px solid #0f3460; padding-bottom: 8px; }}
+  h2 {{ color: #16213e; }}
+  .metrics {{ background: #f5f5f5; border-radius: 8px; padding: 16px; margin: 16px 0; }}
+  .metrics p {{ margin: 4px 0; }}
+  a {{ color: #0f3460; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #ddd; padding: 8px 12px; text-align: left; }}
+  th {{ background: #f0f0f0; }}
+  code {{ background: #f4f4f4; padding: 2px 6px; border-radius: 4px; }}
+  pre {{ background: #f4f4f4; padding: 12px; border-radius: 8px; overflow-x: auto; }}
+</style>
+</head>
+<body>
+  <h1>Research Report: {query}</h1>
+  {trust_html}
+  <div class="report">{report_html}</div>
+  <h2>Sources</h2>
+  <ol>{sources_html}</ol>
+  <hr>
+  <p><em>Generated by Deep Research Agent</em></p>
+</body>
+</html>"""
+
+    @staticmethod
+    def _chunk_report(text: str, max_chars: int = 800) -> List[str]:
+        """Split report into chunks for PPTX slides."""
+        paragraphs = text.split("\n\n")
+        chunks: List[str] = []
+        current = ""
+        for p in paragraphs:
+            if len(current) + len(p) > max_chars and current:
+                chunks.append(current.strip())
+                current = p
+            else:
+                current += "\n\n" + p if current else p
+        if current.strip():
+            chunks.append(current.strip())
+        return chunks or ["No report content"]
