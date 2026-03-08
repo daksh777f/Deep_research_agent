@@ -243,3 +243,248 @@ class EvidenceGraph:
             return None
         
         edges = self.get_edges_for_claim(claim_id)
+        
+        supporting = []
+        contradicting = []
+        mentioning = []
+        
+        for edge in edges:
+            source = self._sources.get(edge.to_source_id)
+            if not source:
+                continue
+            
+            pair = (source, edge.strength)
+            if edge.relation == EvidenceRelation.SUPPORTS:
+                supporting.append(pair)
+            elif edge.relation == EvidenceRelation.CONTRADICTS:
+                contradicting.append(pair)
+            else:
+                mentioning.append(pair)
+        
+        confidence = self.claim_support_score(claim_id)
+        
+        return ClaimEvidence(
+            claim=claim,
+            supporting_sources=sorted(supporting, key=lambda x: -x[1]),
+            contradicting_sources=sorted(contradicting, key=lambda x: -x[1]),
+            mentioning_sources=sorted(mentioning, key=lambda x: -x[1]),
+            aggregated_confidence=confidence,
+            support_count=len(supporting),
+            contradict_count=len(contradicting),
+        )
+    
+    def get_claim_provenance(self, claim_id: str) -> Dict[str, Any]:
+        """
+        Get full provenance trail for a claim.
+        
+        Useful for audit and transparency.
+        
+        Returns:
+            Dictionary with claim details and all evidence
+        """
+        evidence = self.get_claim_evidence(claim_id)
+        if not evidence:
+            return {}
+        
+        return {
+            "claim_id": claim_id,
+            "claim_text": evidence.claim.text,
+            "confidence": evidence.aggregated_confidence,
+            "supporting_sources": [
+                {
+                    "source_id": s.id,
+                    "url": s.url,
+                    "title": s.title,
+                    "reliability": s.reliability_score,
+                    "strength": strength,
+                }
+                for s, strength in evidence.supporting_sources
+            ],
+            "contradicting_sources": [
+                {
+                    "source_id": s.id,
+                    "url": s.url,
+                    "title": s.title,
+                    "reliability": s.reliability_score,
+                    "strength": strength,
+                }
+                for s, strength in evidence.contradicting_sources
+            ],
+            "provenance_chain": evidence.claim.provenance,
+            "support_count": evidence.support_count,
+            "contradict_count": evidence.contradict_count,
+        }
+    
+    def detect_contradictions(self) -> List[Dict[str, Any]]:
+        """
+        Detect all contradictions in the graph.
+        
+        Returns:
+            List of contradiction reports
+        """
+        contradictions = []
+        
+        for claim_id, claim in self._claims.items():
+            contras = self.contradictory_claims(claim_id)
+            if contras:
+                contradictions.append({
+                    "claim_id": claim_id,
+                    "claim_text": claim.text,
+                    "contradictions": [
+                        {
+                            "other_claim_id": other.id,
+                            "other_claim_text": other.text,
+                            "via_source": source.url,
+                            "strength": strength,
+                        }
+                        for other, source, strength in contras
+                    ]
+                })
+        
+        return contradictions
+    
+    def get_all_claims_with_confidence(self) -> List[Tuple[Claim, float]]:
+        """
+        Get all claims sorted by confidence.
+        
+        Returns:
+            List of (Claim, confidence) tuples
+        """
+        results = []
+        for claim_id, claim in self._claims.items():
+            confidence = self.claim_support_score(claim_id)
+            results.append((claim, confidence))
+        
+        return sorted(results, key=lambda x: -x[1])
+    
+    def cluster_claims_by_topic(self) -> Dict[str, List[Claim]]:
+        """
+        Group claims by overlapping sources (topic clustering).
+        
+        Claims that share sources are likely related.
+        
+        Returns:
+            Dictionary of topic_id -> claims
+        """
+        # Build source -> claims mapping
+        source_claims: Dict[str, List[str]] = defaultdict(list)
+        for claim_id, claim in self._claims.items():
+            for source_id in claim.provenance:
+                source_claims[source_id].append(claim_id)
+        
+        # Find connected components (claims that share sources)
+        visited = set()
+        clusters: Dict[str, List[Claim]] = {}
+        cluster_id = 0
+        
+        for claim_id in self._claims:
+            if claim_id in visited:
+                continue
+            
+            # BFS to find connected claims
+            cluster = []
+            queue = [claim_id]
+            
+            while queue:
+                cid = queue.pop(0)
+                if cid in visited:
+                    continue
+                visited.add(cid)
+                
+                claim = self._claims.get(cid)
+                if claim:
+                    cluster.append(claim)
+                
+                # Add claims that share sources
+                for source_id in (claim.provenance if claim else []):
+                    for related_cid in source_claims.get(source_id, []):
+                        if related_cid not in visited:
+                            queue.append(related_cid)
+            
+            if cluster:
+                clusters[f"topic_{cluster_id}"] = cluster
+                cluster_id += 1
+        
+        return clusters
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize graph to dictionary."""
+        return {
+            "claims": {cid: c.to_dict() for cid, c in self._claims.items()},
+            "sources": {sid: s.to_dict() for sid, s in self._sources.items()},
+            "edges": {eid: e.to_dict() for eid, e in self._edges.items()},
+        }
+
+    def to_graph_json(self) -> Dict[str, Any]:
+        """
+        Serialize graph to D3-compatible { nodes, edges } format
+        for the Visual Evidence Graph frontend component.
+        """
+        nodes = []
+        edges = []
+
+        for cid, claim in self._claims.items():
+            nodes.append({
+                "id": cid,
+                "type": "claim",
+                "label": (claim.text[:80] + "…") if len(claim.text) > 80 else claim.text,
+                "confidence": round(claim.confidence, 2) if claim.confidence else 0.5,
+            })
+
+        for sid, source in self._sources.items():
+            nodes.append({
+                "id": sid,
+                "type": "source",
+                "label": source.title[:60] if source.title else (source.domain or source.url[:40]),
+                "reliability": round(source.reliability_score, 2) if source.reliability_score else 0.5,
+                "domain": source.domain or "",
+            })
+
+        for eid, edge in self._edges.items():
+            edges.append({
+                "source": edge.from_claim_id,
+                "target": edge.to_source_id,
+                "relation": edge.relation.value if hasattr(edge.relation, "value") else str(edge.relation),
+                "strength": round(edge.strength, 2),
+            })
+
+        return {"nodes": nodes, "edges": edges}
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], storage=None) -> "EvidenceGraph":
+        """Deserialize graph from dictionary."""
+        graph = cls(storage=storage)
+        
+        for claim_data in data.get("claims", {}).values():
+            graph._claims[claim_data["id"]] = Claim.from_dict(claim_data)
+        
+        for source_data in data.get("sources", {}).values():
+            graph._sources[source_data["id"]] = Source.from_dict(source_data)
+        
+        for edge_data in data.get("edges", {}).values():
+            edge = EvidenceEdge.from_dict(edge_data)
+            graph._edges[edge.id] = edge
+            graph._claim_to_edges[edge.from_claim_id].append(edge.id)
+            graph._source_to_edges[edge.to_source_id].append(edge.id)
+        
+        return graph
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get graph statistics."""
+        support_count = sum(
+            1 for e in self._edges.values()
+            if e.relation == EvidenceRelation.SUPPORTS
+        )
+        contradict_count = sum(
+            1 for e in self._edges.values()
+            if e.relation == EvidenceRelation.CONTRADICTS
+        )
+        
+        return {
+            "claim_count": len(self._claims),
+            "source_count": len(self._sources),
+            "edge_count": len(self._edges),
+            "support_edges": support_count,
+            "contradict_edges": contradict_count,
+            "mention_edges": len(self._edges) - support_count - contradict_count,
+        }
