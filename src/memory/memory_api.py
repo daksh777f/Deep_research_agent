@@ -339,3 +339,345 @@ class MemoryAPI:
         # Add source to provenance
         claim.provenance.append(source_id)
         
+        # Store claim in-memory
+        self._claims[claim.id] = claim
+        
+        # Create evidence edge
+        edge = EvidenceEdge(
+            from_claim_id=claim.id,
+            to_source_id=source_id,
+            relation=relation,
+            strength=strength,
+        )
+        await self.add_edge(edge)
+        
+        return claim.id
+    
+    async def get_claim(self, claim_id: str) -> Optional[Claim]:
+        """Get a claim by ID."""
+        return self._claims.get(claim_id)
+    
+    async def update_claim(self, claim: Claim) -> None:
+        """Update a claim."""
+        claim.updated_at = datetime.now()
+        self._claims[claim.id] = claim
+    
+    async def deduplicate_claim(
+        self,
+        claim: Claim,
+        threshold: float = 0.85,
+    ) -> Optional[str]:
+        """
+        Check if a similar claim already exists.
+        
+        Args:
+            claim: Claim to check
+            threshold: Similarity threshold for deduplication
+            
+        Returns:
+            Existing claim ID if duplicate found, None otherwise
+        """
+        if not claim.embedding:
+            return None
+        
+        # In-memory deduplication not implemented (requires cosine similarity)
+        return None
+    
+    async def query_claims(
+        self,
+        text: str,
+        k: int = 10,
+        threshold: float = 0.7,
+    ) -> List[Claim]:
+        """
+        Query claims by semantic similarity.
+        
+        Args:
+            text: Query text
+            k: Number of results
+            threshold: Minimum similarity
+            
+        Returns:
+            List of matching claims
+        """
+        if not self.embedding_service:
+            return []
+        
+        embedding = await self.embedding_service.embed(text)
+        
+        # In-memory claim search not implemented (requires cosine similarity)
+        return []
+    
+    # ===============================
+    # Evidence Graph Operations
+    # ===============================
+    
+    async def add_edge(self, edge: EvidenceEdge) -> str:
+        """Add an evidence edge to the graph."""
+        self._edges[edge.id] = edge
+        return edge.id
+    
+    async def get_evidence(self, claim_id: str) -> List[EvidenceEdge]:
+        """Get all evidence edges for a claim."""
+        return [e for e in self._edges.values() if e.from_claim_id == claim_id]
+    
+    async def get_supporting_sources(
+        self,
+        claim_id: str,
+        n: int = 5,
+    ) -> List[Source]:
+        """
+        Get sources that support a claim.
+        
+        Args:
+            claim_id: Claim to get support for
+            n: Maximum sources to return
+            
+        Returns:
+            List of supporting sources, ordered by strength
+        """
+        edges = [
+            e for e in self._edges.values()
+            if e.from_claim_id == claim_id and e.relation == EvidenceRelation.SUPPORTS
+        ]
+        
+        # Sort by strength and get source IDs
+        edges = sorted(edges, key=lambda e: e.strength, reverse=True)[:n]
+        source_ids = [e.to_source_id for e in edges]
+        
+        return await self.get_sources_by_ids(source_ids)
+    
+    async def get_contradicting_sources(
+        self,
+        claim_id: str,
+        n: int = 5,
+    ) -> List[Source]:
+        """Get sources that contradict a claim."""
+        edges = [
+            e for e in self._edges.values()
+            if e.from_claim_id == claim_id and e.relation == EvidenceRelation.CONTRADICTS
+        ]
+        
+        edges = sorted(edges, key=lambda e: e.strength, reverse=True)[:n]
+        source_ids = [e.to_source_id for e in edges]
+        
+        return await self.get_sources_by_ids(source_ids)
+    
+    async def calculate_claim_confidence(self, claim_id: str) -> float:
+        """
+        Calculate aggregated confidence score for a claim.
+        
+        Based on:
+        - Number and strength of supporting edges
+        - Number and strength of contradicting edges
+        - Reliability scores of linked sources
+        
+        Returns:
+            Confidence score between 0 and 1
+        """
+        edges = await self.get_evidence(claim_id)
+        if not edges:
+            return 0.0
+        
+        support_score = 0.0
+        contradict_score = 0.0
+        
+        for edge in edges:
+            source = await self.get_source(edge.to_source_id)
+            reliability = source.reliability_score if source else 0.5
+            
+            if edge.relation == EvidenceRelation.SUPPORTS:
+                support_score += edge.strength * reliability
+            elif edge.relation == EvidenceRelation.CONTRADICTS:
+                contradict_score += edge.strength * reliability
+        
+        total = support_score + contradict_score
+        if total == 0:
+            return 0.0
+        
+        confidence = support_score / total
+        
+        # Update claim's confidence
+        claim = await self.get_claim(claim_id)
+        if claim:
+            claim.confidence = confidence
+            await self.update_claim(claim)
+        
+        return confidence
+    
+    # ===============================
+    # Snapshot Operations
+    # ===============================
+    
+    async def create_snapshot(
+        self,
+        session_id: str,
+        compressed_text: str,
+        claim_ids: List[str],
+    ) -> str:
+        """
+        Create a compressed snapshot of session state.
+        
+        Args:
+            session_id: Session to snapshot
+            compressed_text: Compressed summary text
+            claim_ids: Claims included in this snapshot
+            
+        Returns:
+            Snapshot ID
+        """
+        session = await self.get_session(session_id)
+        iteration = session.iterations if session else 0
+        
+        snapshot = SummarySnapshot(
+            session_id=session_id,
+            compressed_text=compressed_text,
+            size_bytes=len(compressed_text.encode()),
+            iteration_number=iteration,
+            claim_ids=claim_ids,
+        )
+        
+        # Generate embedding for snapshot retrieval
+        if self.embedding_service and compressed_text:
+            snapshot.embedding = await self.embedding_service.embed(compressed_text)
+        
+        self._snapshots[snapshot.id] = snapshot
+        
+        # Update session with latest snapshot
+        if session:
+            session.summary_snapshot_id = snapshot.id
+            await self.update_session(session)
+        
+        return snapshot.id
+    
+    async def get_snapshots(self, session_id: str) -> List[SummarySnapshot]:
+        """Get all snapshots for a session."""
+        return [s for s in self._snapshots.values() if s.session_id == session_id]
+    
+    # ===============================
+    # Semantic Memory (Qdrant)
+    # ===============================
+    
+    def store_research_findings(
+        self,
+        session_id: str,
+        query: str,
+        findings: List[Dict[str, Any]],
+        user_id: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Store research findings as semantic memories via Qdrant.
+        
+        Args:
+            session_id: Research session ID
+            query: Original query
+            findings: Validated findings
+            user_id: User identifier
+            
+        Returns:
+            List of memory IDs
+        """
+        if not self.vector_store or not self.embedding_service:
+            logger.warning(
+                "Skipping semantic store (vector_store or embedding missing)",
+                extra={"component": "memory", "backend": "qdrant", "action": "store_findings"},
+            )
+            return []
+
+        def _normalize_vector(raw_vector: Any) -> List[float]:
+            if isinstance(raw_vector, list):
+                return [float(v) for v in raw_vector]
+            if isinstance(raw_vector, tuple):
+                return [float(v) for v in raw_vector]
+            raise TypeError(
+                f"Embedding returned unsupported type: {type(raw_vector).__name__}"
+            )
+
+        memory_ids: List[str] = []
+        for i, finding in enumerate(findings):
+            text = finding.get("content") or finding.get("text") or finding.get("snippet") or ""
+            if not text:
+                continue
+            vector: Optional[List[float]] = None
+            embed_fn = getattr(self.embedding_service, "embed", None)
+            embed_sync_fn = getattr(self.embedding_service, "embed_sync", None)
+            if embed_sync_fn and callable(embed_sync_fn):
+                vector = _normalize_vector(embed_sync_fn(text))
+            elif embed_fn and callable(embed_fn):
+                if inspect.iscoroutinefunction(embed_fn):
+                    raise RuntimeError(
+                        "Embedding service provides async embed; use async store or embed_sync"
+                    )
+                vector = _normalize_vector(embed_fn(text))
+
+            if vector is None:
+                continue
+
+            memory_id = finding.get("id") or f"{session_id}-{i}"
+            payload = {
+                "session_id": session_id,
+                "query": query,
+                "user_id": user_id,
+                "finding": finding,
+            }
+            if asyncio.iscoroutinefunction(self.vector_store.upsert):
+                self._run_coro_sync(self.vector_store.upsert(memory_id, vector, payload))
+            else:
+                self.vector_store.upsert(memory_id, vector, payload)  # type: ignore
+            memory_ids.append(memory_id)
+
+        return memory_ids
+    
+    async def recall_memories(
+        self,
+        query: str,
+        user_id: Optional[str] = None,
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Recall relevant memories for a query via vector search.
+        
+        Args:
+            query: Search query
+            user_id: User context
+            top_k: Number of results
+            
+        Returns:
+            List of relevant memories (dicts with id, score, payload)
+        """
+        if not self.vector_store or not self.embedding_service:
+            logger.warning(
+                "Skipping recall (vector_store or embedding missing)",
+                extra={"component": "memory", "backend": "qdrant", "action": "recall"},
+            )
+            return []
+
+        try:
+            vector = await self.embedding_service.embed(query)
+        except Exception as e:
+            logger.warning("Embedding failed during recall: %s", e)
+            return []
+
+        try:
+            results = await self.vector_store.search(vector, top_k=top_k)
+            return results
+        except Exception as e:
+            logger.warning("Vector store search failed: %s", e)
+            return []
+    
+    async def get_session_memories(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get memories for a session (vector search fallback)."""
+        if not self.vector_store:
+            logger.warning(
+                "Skipping session memories (vector_store missing)",
+                extra={"component": "memory", "backend": "qdrant", "action": "session_memories"},
+            )
+            return []
+        # Simple approach: search broadly and filter by session_id
+        try:
+            dummy_vector = [0.0] * getattr(self.vector_store, "embedding_dim", 1536)
+            hits = await self.vector_store.search(dummy_vector, top_k=50)
+            return [h for h in hits if h.get("payload", {}).get("session_id") == session_id]
+        except Exception as e:
+            logger.warning("Vector store session retrieval failed: %s", e)
+            return []
