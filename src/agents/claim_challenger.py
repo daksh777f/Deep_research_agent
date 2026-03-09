@@ -163,3 +163,169 @@ class ClaimChallenger:
             if len(lines) >= 3:
                 return lines[:3]
             return lines + self._fallback_queries(claim_text)[len(lines):]
+        except Exception as e:
+            logger.warning("LLM query generation failed: %s", e)
+            return self._fallback_queries(claim_text)
+
+    @staticmethod
+    def _fallback_queries(claim_text: str) -> List[str]:
+        short = claim_text[:80]
+        return [
+            f"evidence for or against: {short}",
+            f"is it true that {short}",
+            f"fact check {short}",
+        ]
+
+    # ------------------------------------------------------------------
+    # Search
+    # ------------------------------------------------------------------
+
+    async def _search_one(
+        self, query: str, exclude_domains: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Search via Tavily (or mock), filtering out excluded domains."""
+        try:
+            if self.search_provider == "tavily" and TavilyClient and self._tavily_key:
+                return await self._search_tavily(query, exclude_domains)
+            return self._mock_search(query)
+        except Exception as e:
+            logger.warning("Search failed for query '%s': %s", query, e)
+            return []
+
+    async def _search_tavily(
+        self, query: str, exclude_domains: List[str]
+    ) -> List[Dict[str, Any]]:
+        client = TavilyClient(api_key=self._tavily_key)
+        result = await asyncio.to_thread(
+            client.search,
+            query=query,
+            max_results=5,
+            search_depth="advanced",
+            exclude_domains=exclude_domains,
+        )
+        sources = []
+        for item in result.get("results", []):
+            domain = ""
+            try:
+                domain = urlparse(item.get("url", "")).netloc.replace("www.", "")
+            except Exception:
+                pass
+            sources.append({
+                "url": item.get("url", ""),
+                "title": item.get("title", ""),
+                "content": item.get("content", ""),
+                "domain": domain,
+                "reliability": 0.6,
+            })
+        return sources
+
+    @staticmethod
+    def _mock_search(query: str) -> List[Dict[str, Any]]:
+        return [
+            {
+                "url": f"https://example.com/challenge/{i}",
+                "title": f"Challenge source {i} for: {query[:40]}",
+                "content": f"Mock challenge evidence for: {query}",
+                "domain": "example.com",
+                "reliability": 0.5,
+            }
+            for i in range(3)
+        ]
+
+    # ------------------------------------------------------------------
+    # Verdict evaluation
+    # ------------------------------------------------------------------
+
+    async def _evaluate_verdict(
+        self,
+        claim_text: str,
+        sources: List[Dict[str, Any]],
+        confidence_before: float,
+    ) -> Dict[str, Any]:
+        """Evaluate whether the new sources corroborate, refute, or dispute the claim."""
+        if not self.llm or not sources:
+            return {
+                "verdict": "disputed",
+                "confidence_after": confidence_before,
+                "summary": "Insufficient independent evidence to conclusively verify or refute.",
+            }
+
+        source_summaries = "\n".join(
+            f"- [{s.get('domain', 'unknown')}] {s.get('title', '')}: {(s.get('content') or '')[:200]}"
+            for s in sources[:6]
+        )
+
+        prompt = (
+            "You are an impartial fact-checker evaluating a claim against new independent evidence.\n\n"
+            f"CLAIM: \"{claim_text}\"\n\n"
+            f"NEW INDEPENDENT EVIDENCE:\n{source_summaries}\n\n"
+            "Based on the evidence above, respond in EXACTLY this format:\n"
+            "VERDICT: <corroborated|refuted|disputed>\n"
+            "CONFIDENCE: <float 0.0 to 1.0>\n"
+            "SUMMARY: <2-3 sentence explanation>\n\n"
+            "Rules:\n"
+            "- 'corroborated' = strong independent support found\n"
+            "- 'refuted' = strong independent counter-evidence found\n"
+            "- 'disputed' = mixed or insufficient evidence\n"
+        )
+
+        try:
+            resp = await asyncio.to_thread(
+                self.llm.generate, prompt, task_type="validate"
+            )
+            text = resp.content.strip()
+            verdict = "disputed"
+            confidence_after = confidence_before
+            summary = text
+
+            # Parse structured response
+            for line in text.split("\n"):
+                line_l = line.strip().upper()
+                if line_l.startswith("VERDICT:"):
+                    raw = line.split(":", 1)[1].strip().lower()
+                    if raw in ("corroborated", "refuted", "disputed"):
+                        verdict = raw
+                elif line_l.startswith("CONFIDENCE:"):
+                    try:
+                        confidence_after = float(line.split(":", 1)[1].strip())
+                        confidence_after = max(0.0, min(1.0, confidence_after))
+                    except ValueError:
+                        pass
+                elif line_l.startswith("SUMMARY:"):
+                    summary = line.split(":", 1)[1].strip()
+
+            # Mark source agreement
+            for s in sources:
+                s["agrees"] = verdict == "corroborated"
+
+            return {
+                "verdict": verdict,
+                "confidence_after": round(confidence_after, 2),
+                "summary": summary,
+            }
+        except Exception as e:
+            logger.warning("Verdict evaluation failed: %s", e)
+            return {
+                "verdict": "disputed",
+                "confidence_after": confidence_before,
+                "summary": "Evaluation failed — insufficient data.",
+            }
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _empty_result(
+        marker: str, text: str, conf: float, reason: str = "error"
+    ) -> Dict[str, Any]:
+        return {
+            "claim_marker": marker,
+            "claim_text": text,
+            "verdict": "disputed",
+            "confidence_before": conf,
+            "confidence_after": conf,
+            "summary": f"Challenge could not complete ({reason}).",
+            "new_sources": [],
+            "challenge_queries": [],
+        }
