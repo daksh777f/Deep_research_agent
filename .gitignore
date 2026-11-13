@@ -72,3 +72,23 @@ firebase_key.json
 # Docker
 .docker/
 
+
+# Secrets
+.env.*
+!.env.example
+*.pem
+*.key
+
+# OS / editor
+Thumbs.db
+
+# Node
+node_modules/
+.next/
+out/
+.vercel/
+npm-debug.log*
+yarn-error.log*
+
+# Python
+.ipynb_checkpoints/
